@@ -123,13 +123,8 @@ function set_all_url_params(params, { replace_history_state = false } = {}) {
 			}
 		}
 	}
-	let query_string = location.search;
-	// The Discord Activity needs to preserve the query string, so it's exempt from this.
-	if (!query_string.includes("frame_id")) {
-		// Omit query string for theoretical backwards compatibility with old URLs.
-		// TODO: what were these URLs? do they really still work? are they still relevant? probably not...
-		query_string = "";
-	}
+	// 2draw: always preserve the query string (?w=&h=&load=...), so a reload keeps the canvas size and starting image.
+	const query_string = location.search;
 	const new_url = `${location.origin}${location.pathname}${query_string}#${new_hash}`;
 	try {
 		// can fail when running from file: protocol
