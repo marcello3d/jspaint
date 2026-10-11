@@ -783,11 +783,7 @@ $G.on("keydown", (e) => {
 	// probably best to use a library at this point!
 
 	if (selection) {
-		const nudge_selection = (delta_x, delta_y) => {
-			selection.x += delta_x;
-			selection.y += delta_y;
-			selection.position();
-		};
+		const nudge_selection = (delta_x, delta_y) => window.P95.cmd("nudge_selection", [delta_x, delta_y], nudge_selection_impl);
 		switch (e.key) {
 			case "ArrowLeft":
 				nudge_selection(-1, 0);
@@ -859,7 +855,7 @@ $G.on("keydown", (e) => {
 		const delta = Number(plus) - Number(minus); // const delta = +plus++ -minus--; // Δ = ±±±±
 
 		if (selection) {
-			selection.scale(2 ** delta);
+			window.P95.cmd("scale_selection", [2 ** delta], scale_selection_impl);
 		} else {
 			if (selected_tool.id === TOOL_BRUSH) {
 				brush_size = Math.max(1, Math.min(brush_size + delta, 500));
@@ -998,6 +994,28 @@ $G.on("keydown", (e) => {
 	}
 });
 // #endregion
+
+// 2draw: commands for recording/replay (see paint95-core.js)
+function nudge_selection_impl(delta_x, delta_y) {
+	if (!selection) return;
+	selection.x += delta_x;
+	selection.y += delta_y;
+	selection.position();
+}
+function scale_selection_impl(factor) {
+	selection?.scale(factor);
+}
+window.P95.register({
+	nudge_selection: nudge_selection_impl,
+	scale_selection: scale_selection_impl,
+	tick: () => {
+		for (const tool of selected_tools) {
+			if (tool.paint_on_time_interval != null) {
+				tool_go(tool);
+			}
+		}
+	},
+});
 
 // #region Alt+Mousewheel Zooming (and also some dev helper that I haven't used in years)
 let alt_zooming = false;
@@ -1336,7 +1354,7 @@ $canvas_area.on("pointerdown", (event) => {
 		});
 	}
 	if (pointers.length === 1) {
-		first_pointer_time = performance.now();
+		first_pointer_time = window.P95.now(); // 2draw: virtual clock for replay
 	}
 	if (pointers.length == 2) {
 		last_zoom_pointer_distance = Math.hypot(pointers[0].x - pointers[1].x, pointers[0].y - pointers[1].y);
@@ -1349,7 +1367,7 @@ $canvas_area.on("pointerdown", (event) => {
 	if (pointers.length >= 2) {
 		// If you press two fingers quickly, it shouldn't make a new history entry.
 		// But if you draw something and then press a second finger to clear it, it should let you redo.
-		const discard_document_state = first_pointer_time && performance.now() - first_pointer_time < discard_quick_undo_period;
+		const discard_document_state = first_pointer_time && window.P95.now() - first_pointer_time < discard_quick_undo_period;
 		cancel(false, discard_document_state);
 		pointer_active = false; // NOTE: pointer_active used in cancel(); must be set after cancel()
 		return;
@@ -1423,7 +1441,7 @@ $canvas.on("pointerdown", (e) => {
 	if (pointers.length >= 1) {
 		// If you press two fingers quickly, it shouldn't make a new history entry.
 		// But if you draw something and then press a second finger to clear it, it should let you redo.
-		const discard_document_state = first_pointer_time && performance.now() - first_pointer_time < discard_quick_undo_period;
+		const discard_document_state = first_pointer_time && window.P95.now() - first_pointer_time < discard_quick_undo_period;
 		cancel(false, discard_document_state);
 		pointer_active = false; // NOTE: pointer_active used in cancel(); must be set after cancel()
 
@@ -1468,9 +1486,12 @@ $canvas.on("pointerdown", (e) => {
 			if (selected_tool.paint || selected_tool.pointerdown) {
 				tool_go(selected_tool, "pointerdown");
 			}
-			if (selected_tool.paint_on_time_interval != null) {
+			// 2draw: when replaying, the recorded ticks drive this instead (see P95.tick and the "tick" command)
+			if (selected_tool.paint_on_time_interval != null && !window.P95.replaying) {
 				interval_ids.push(setInterval(() => {
-					tool_go(selected_tool);
+					window.P95.tick(() => {
+						tool_go(selected_tool);
+					});
 				}, selected_tool.paint_on_time_interval));
 			}
 		});

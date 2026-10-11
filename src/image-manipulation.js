@@ -763,7 +763,7 @@ function draw_noncontiguous_fill_separately(source_ctx, dest_ctx, x, y) {
  * @param {{name: string, icon: HTMLImageElement | HTMLCanvasElement}} meta - object containing the name and icon for undo history.
  * @param {(original_canvas: PixelCanvas, original_ctx: PixelContext, new_canvas: PixelCanvas, new_ctx: PixelContext) => void} fn - The image transformation function to apply.
  */
-function apply_image_transformation(meta, fn) {
+function apply_image_transformation(meta, fn, { snapshot = false } = {}) {
 	const original_canvas = selection ? selection.source_canvas : main_canvas;
 
 	const new_canvas = make_canvas(original_canvas.width, original_canvas.height);
@@ -772,6 +772,24 @@ function apply_image_transformation(meta, fn) {
 	const new_ctx = new_canvas.ctx;
 
 	fn(original_canvas, original_ctx, new_canvas, new_ctx);
+
+	// 2draw: transformed drawImage (skew, arbitrary rotation) isn't pixel-identical across browsers,
+	// so the recorder stores the result and replay uses it.
+	if (snapshot) {
+		if (window.P95.replaying) {
+			const data = window.P95.take("transform");
+			if (data) {
+				new_canvas.width = data.width;
+				new_canvas.height = data.height;
+				new_ctx.putImageData(data, 0, 0);
+			}
+		} else {
+			// normalize (premultiplied alpha round trip) so the recording is in the same state as a replay
+			const data = new_ctx.getImageData(0, 0, new_canvas.width, new_canvas.height);
+			new_ctx.putImageData(data, 0, 0);
+			window.P95.put("transform", data);
+		}
+	}
 
 	if (selection) {
 		undoable({
@@ -799,7 +817,26 @@ function apply_image_transformation(meta, fn) {
 	}
 }
 
-function flip_horizontal() {
+// 2draw: recorded/replayed commands (see paint95-core.js)
+function flip_horizontal() { return window.P95.cmd("flip_horizontal", [], flip_horizontal_impl); }
+function flip_vertical() { return window.P95.cmd("flip_vertical", [], flip_vertical_impl); }
+/** @param {number} angle */
+function rotate(angle) { return window.P95.cmd("rotate", [angle], rotate_impl); }
+/**
+ * @param {number} x_scale
+ * @param {number} y_scale
+ * @param {number} h_skew
+ * @param {number} v_skew
+ */
+function stretch_and_skew(x_scale, y_scale, h_skew, v_skew) { return window.P95.cmd("stretch_and_skew", [x_scale, y_scale, h_skew, v_skew], stretch_and_skew_impl); }
+window.P95.register({
+	flip_horizontal: () => flip_horizontal_impl(),
+	flip_vertical: () => flip_vertical_impl(),
+	rotate: (angle) => rotate_impl(angle),
+	stretch_and_skew: (x_scale, y_scale, h_skew, v_skew) => stretch_and_skew_impl(x_scale, y_scale, h_skew, v_skew),
+});
+
+function flip_horizontal_impl() {
 	apply_image_transformation({
 		name: localize("Flip horizontal"),
 		icon: get_help_folder_icon("p_fliph.png"),
@@ -810,7 +847,7 @@ function flip_horizontal() {
 	});
 }
 
-function flip_vertical() {
+function flip_vertical_impl() {
 	apply_image_transformation({
 		name: localize("Flip vertical"),
 		icon: get_help_folder_icon("p_flipv.png"),
@@ -826,7 +863,7 @@ function flip_vertical() {
  *
  * @param {number} angle - The angle of rotation in radians.
  */
-function rotate(angle) {
+function rotate_impl(angle) {
 	apply_image_transformation({
 		name: `${localize("Rotate by angle")} ${angle / TAU * 360} ${localize("Degrees")}`,
 		icon: get_help_folder_icon(`p_rotate_${angle >= 0 ? "cw" : "ccw"}.png`),
@@ -898,7 +935,7 @@ function rotate(angle) {
 		}
 		new_ctx.drawImage(original_canvas, 0, 0);
 		new_ctx.restore();
-	});
+	}, { snapshot: true }); // even right angles: the rotation matrix isn't exact (cos(TAU / 4) !== 0)
 }
 
 /**
@@ -909,7 +946,7 @@ function rotate(angle) {
  * @param {number} h_skew - The horizontal skew angle in radians.
  * @param {number} v_skew - The vertical skew angle in radians.
  */
-function stretch_and_skew(x_scale, y_scale, h_skew, v_skew) {
+function stretch_and_skew_impl(x_scale, y_scale, h_skew, v_skew) {
 	apply_image_transformation({
 		name:
 			(h_skew !== 0 || v_skew !== 0) ? (
@@ -969,7 +1006,7 @@ function stretch_and_skew(x_scale, y_scale, h_skew, v_skew) {
 		);
 		new_ctx.drawImage(original_canvas, 0, 0, w, h);
 		new_ctx.restore();
-	});
+	}, { snapshot: true });
 }
 
 /**
@@ -1490,7 +1527,8 @@ export function init_webgl_stuff() {
 	op_canvas_2d = document.createElement("canvas");
 	op_ctx_2d = op_canvas_2d.getContext("2d");
 
-	initWebGL(op_canvas_webgl);
+	// 2draw: polygons are rasterized in software; no WebGL context is created.
+	// initWebGL(op_canvas_webgl);
 
 	let warning_tid;
 	op_canvas_webgl.addEventListener("webglcontextlost", (e) => {
@@ -1562,6 +1600,155 @@ export function draw_polygon(ctx, points, stroke, fill) {
  * @param {boolean} close_path - Whether to join the start and end points, forming a closed polygon.
  */
 function draw_polygon_or_line_strip(ctx, points, stroke, fill, close_path) {
+	// 2draw: rasterize in software instead of with WebGL, so drawings replay identically on every machine,
+	// with or without WebGL. (P95 ENGINE_BEHAVIOR 1) The original is kept below as draw_polygon_or_line_strip_webgl.
+
+	// this must be before stuff is done with op_canvas (see draw_polygon_or_line_strip_webgl)
+	if (stroke && stroke_size > 1) {
+		update_brush_for_drawing_lines(stroke_size);
+	}
+
+	const stroke_color = ctx.strokeStyle;
+	const fill_color = ctx.fillStyle;
+
+	if (points.length === 0) {
+		return;
+	}
+
+	let x_min = +Infinity;
+	let x_max = -Infinity;
+	let y_min = +Infinity;
+	let y_max = -Infinity;
+	for (const { x, y } of points) {
+		x_min = Math.min(x, x_min);
+		x_max = Math.max(x, x_max);
+		y_min = Math.min(y, y_min);
+		y_max = Math.max(y, y_max);
+	}
+	// integer bounds (the WebGL version sized a canvas with these, which truncates)
+	x_min = Math.floor(x_min) - 1;
+	y_min = Math.floor(y_min) - 1;
+	x_max = Math.ceil(x_max) + 1;
+	y_max = Math.ceil(y_max) + 1;
+
+	if (fill) {
+		op_canvas_2d.width = x_max - x_min;
+		op_canvas_2d.height = y_max - y_min;
+		software_fill_polygon(op_ctx_2d, points, x_min, y_min);
+		replace_colors_with_swatch(op_ctx_2d, fill_color, x_min, y_min);
+		ctx.drawImage(op_canvas_2d, x_min, y_min);
+	}
+	if (stroke) {
+		if (stroke_size > 1) {
+			const stroke_margin = ~~(stroke_size * 1.1);
+
+			const op_canvas_x = x_min - stroke_margin;
+			const op_canvas_y = y_min - stroke_margin;
+
+			op_canvas_2d.width = x_max - x_min + stroke_margin * 2;
+			op_canvas_2d.height = y_max - y_min + stroke_margin * 2;
+			for (let i = 0; i < points.length - (close_path ? 0 : 1); i++) {
+				const point_a = points[i];
+				const point_b = points[(i + 1) % points.length];
+				// Note: update_brush_for_drawing_lines way above
+				draw_line_without_pattern_support(
+					op_ctx_2d,
+					point_a.x - op_canvas_x,
+					point_a.y - op_canvas_y,
+					point_b.x - op_canvas_x,
+					point_b.y - op_canvas_y,
+					stroke_size
+				);
+			}
+
+			replace_colors_with_swatch(op_ctx_2d, stroke_color, op_canvas_x, op_canvas_y);
+			ctx.drawImage(op_canvas_2d, op_canvas_x, op_canvas_y);
+		} else {
+			op_canvas_2d.width = x_max - x_min;
+			op_canvas_2d.height = y_max - y_min;
+			software_stroke_polyline(op_ctx_2d, points, close_path, x_min, y_min);
+			replace_colors_with_swatch(op_ctx_2d, stroke_color, x_min, y_min);
+			ctx.drawImage(op_canvas_2d, x_min, y_min);
+		}
+	}
+}
+
+/**
+ * Fills a polygon (even-odd rule, like the libtess default used with WebGL) by sampling pixel centers,
+ * writing opaque black into op_ctx (whose canvas covers the polygon's bounds, offset by x_min/y_min).
+ * Pure JS arithmetic, so it gives the same result on every machine.
+ * @param {CanvasRenderingContext2D} op_ctx
+ * @param {{x: number, y: number}[]} points
+ * @param {number} x_min
+ * @param {number} y_min
+ */
+function software_fill_polygon(op_ctx, points, x_min, y_min) {
+	const width = op_ctx.canvas.width;
+	const height = op_ctx.canvas.height;
+	const image_data = op_ctx.createImageData(width, height);
+	const data = image_data.data;
+	const n = points.length;
+	const xs = [];
+	for (let row = 0; row < height; row++) {
+		const yc = y_min + row + 0.5;
+		xs.length = 0;
+		for (let i = 0; i < n; i++) {
+			const a = points[i];
+			const b = points[(i + 1) % n];
+			if ((a.y <= yc && yc < b.y) || (b.y <= yc && yc < a.y)) {
+				xs.push(a.x + (yc - a.y) * (b.x - a.x) / (b.y - a.y));
+			}
+		}
+		xs.sort((p, q) => p - q);
+		for (let k = 0; k + 1 < xs.length; k += 2) {
+			// pixel columns whose centers are in [xs[k], xs[k+1])
+			const c0 = Math.max(0, Math.ceil(xs[k] - x_min - 0.5));
+			const c1 = Math.min(width, Math.ceil(xs[k + 1] - x_min - 0.5));
+			for (let c = c0; c < c1; c++) {
+				data[(row * width + c) * 4 + 3] = 255;
+			}
+		}
+	}
+	op_ctx.putImageData(image_data, 0, 0);
+}
+
+/**
+ * 1px outline through the points (Bresenham between floored vertices), opaque black, offset by x_min/y_min.
+ * @param {CanvasRenderingContext2D} op_ctx
+ * @param {{x: number, y: number}[]} points
+ * @param {boolean} close_path
+ * @param {number} x_min
+ * @param {number} y_min
+ */
+function software_stroke_polyline(op_ctx, points, close_path, x_min, y_min) {
+	const width = op_ctx.canvas.width;
+	const height = op_ctx.canvas.height;
+	const image_data = op_ctx.createImageData(width, height);
+	const data = image_data.data;
+	const plot = (x, y) => {
+		if (x >= 0 && y >= 0 && x < width && y < height) {
+			data[(y * width + x) * 4 + 3] = 255;
+		}
+	};
+	const n = points.length;
+	if (n === 1) {
+		plot(Math.floor(points[0].x - x_min), Math.floor(points[0].y - y_min));
+	}
+	const segments = close_path ? n : n - 1;
+	for (let i = 0; i < segments; i++) {
+		const a = points[i];
+		const b = points[(i + 1) % n];
+		bresenham_line(
+			Math.floor(a.x - x_min), Math.floor(a.y - y_min),
+			Math.floor(b.x - x_min), Math.floor(b.y - y_min),
+			plot,
+		);
+	}
+	op_ctx.putImageData(image_data, 0, 0);
+}
+
+// eslint-disable-next-line no-unused-vars
+function draw_polygon_or_line_strip_webgl(ctx, points, stroke, fill, close_path) {
 	if (!gl) {
 		// TODO: reload button for Electron app
 		show_error_message("Failed to get WebGL context. You may need to refresh the web page, or restart your computer.");

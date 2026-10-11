@@ -182,7 +182,9 @@ function update_helper_layer(e) {
 }
 function update_helper_layer_immediately() {
 	// window.console?.log("Update helper layer NOW");
-	if (info_for_updating_pointer) {
+	// 2draw: when replaying, events are processed in batches between frames, so this (normally redundant) update
+	// would move the pointer back to a stale position (e.g. where an airbrush stroke started).
+	if (info_for_updating_pointer && !window.P95.replaying) {
 		const rescale = info_for_updating_pointer.devicePixelRatio / devicePixelRatio;
 		info_for_updating_pointer.clientX *= rescale;
 		info_for_updating_pointer.clientY *= rescale;
@@ -647,6 +649,8 @@ function reset_file() {
 function reset_canvas_and_history() {
 	undos.length = 0;
 	redos.length = 0;
+	history_node_counter = 0;
+	history_nodes_by_id.clear();
 	current_history_node = root_history_node = make_history_node({
 		name: localize("New"),
 		icon: get_help_folder_icon("p_blank.png"),
@@ -690,6 +694,10 @@ function reset_canvas_and_history() {
  * @param {HTMLImageElement |HTMLCanvasElement | null=} options.icon - a visual representation of the operation type, shown in the history window, e.g. get_help_folder_icon("p_blank.png")
  * @returns {HistoryNode}
  */
+// 2draw: history nodes get sequential ids so commands like "go to history node" can be recorded and replayed
+let history_node_counter = 0;
+/** @type {Map<number, HistoryNode>} */
+const history_nodes_by_id = new Map();
 function make_history_node({
 	parent = null, // the state before this state (its basis), or null if this is the first state
 	futures = [], // the states branching off from this state (its children)
@@ -712,7 +720,9 @@ function make_history_node({
 	name, // the name of the operation, shown in the history window, e.g. localize("Resize Canvas")
 	icon = null, // an Image representation of the operation type, shown in the history window, e.g. get_help_folder_icon("p_blank.png")
 }) {
-	return {
+	const id = ++history_node_counter;
+	const node = {
+		id,
 		parent,
 		futures,
 		timestamp,
@@ -734,6 +744,8 @@ function make_history_node({
 		name,
 		icon,
 	};
+	history_nodes_by_id.set(id, node);
+	return node;
 }
 
 function update_title() {
@@ -1082,19 +1094,25 @@ function file_new() {
 		if (result !== "ok") {
 			return;
 		}
-		deselect();
-		cancel();
-
-		my_canvas_width = window.paint95_required_width ?? my_canvas_width;
-		my_canvas_height = window.paint95_required_height ?? my_canvas_height;
-
-		reset_file();
-		reset_selected_colors();
-		reset_canvas_and_history(); // (with newly reset colors)
-		set_magnification(default_magnification);
-
-		$G.triggerHandler("session-update"); // autosave
+		new_document();
 	});
+}
+function new_document() { return window.P95.cmd("new_document", [], new_document_impl); }
+function new_document_impl() {
+	deselect();
+	cancel();
+
+	my_canvas_width = window.paint95_required_width ?? my_canvas_width;
+	my_canvas_height = window.paint95_required_height ?? my_canvas_height;
+
+	reset_file();
+	reset_selected_colors();
+	reset_canvas_and_history(); // (with newly reset colors)
+	if (!window.P95.replaying) {
+		set_magnification(default_magnification);
+	}
+
+	$G.triggerHandler("session-update"); // autosave
 }
 
 async function file_open() {
@@ -1744,6 +1762,18 @@ async function choose_file_to_paste() {
  * @param {HTMLImageElement | HTMLCanvasElement} img_or_canvas
  */
 function paste(img_or_canvas) {
+	// 2draw: recorded command; the position is decided here (it depends on the scroll position) and recorded,
+	// and the recorder stores the image (as normalized RGBA) in the animation.
+	const x = Math.max(0, Math.ceil($canvas_area.scrollLeft() / magnification));
+	const y = Math.max(0, Math.ceil(($canvas_area.scrollTop()) / magnification));
+	return window.P95.cmd("paste", [img_or_canvas, x, y], paste_impl);
+}
+/**
+ * @param {HTMLImageElement | HTMLCanvasElement} img_or_canvas
+ * @param {number} x
+ * @param {number} y
+ */
+function paste_impl(img_or_canvas, x, y) {
 
 	// 2draw: the canvas size is fixed, so never offer to enlarge it for a paste.
 	// (The pasted selection can hang off the edge; it gets clipped when it's melded in.)
@@ -1803,8 +1833,6 @@ function paste(img_or_canvas) {
 		deselect();
 		select_tool(get_tool_by_id(TOOL_SELECT));
 
-		const x = Math.max(0, Math.ceil($canvas_area.scrollLeft() / magnification));
-		const y = Math.max(0, Math.ceil(($canvas_area.scrollTop()) / magnification));
 		// Nevermind, canvas, isn't aligned to the right in RTL layout!
 		// let x = Math.max(0, Math.ceil($canvas_area.scrollLeft() / magnification));
 		// if (get_direction() === "rtl") {
@@ -1932,7 +1960,15 @@ function render_history_as_gif() {
  * @param {HistoryNode} target_history_node
  * @param {boolean=} canceling
  */
+// 2draw: recorded/replayed command (see paint95-core.js)
+/**
+ * @param {HistoryNode} target_history_node
+ * @param {boolean} [canceling]
+ */
 function go_to_history_node(target_history_node, canceling) {
+	return window.P95.cmd("go_to_history_node", [target_history_node.id, !!canceling], () => go_to_history_node_impl(target_history_node, canceling));
+}
+function go_to_history_node_impl(target_history_node, canceling) {
 	const from_history_node = current_history_node;
 
 	if (!target_history_node.image_data) {
@@ -2121,7 +2157,9 @@ function make_or_update_undoable(undoable_meta, undoable_action) {
 		undoable(undoable_meta, undoable_action);
 	}
 }
-function undo() {
+// 2draw: recorded/replayed command (see paint95-core.js)
+function undo() { return window.P95.cmd("undo", [], undo_impl); }
+function undo_impl() {
 	if (undos.length < 1) { return false; }
 
 	redos.push(current_history_node);
@@ -2140,7 +2178,9 @@ function undo() {
 // @TODO: use Clippy.js instead for potentially annoying tips
 /** @type {OSGUI$Window} */
 let $document_history_prompt_window;
-function redo() {
+// 2draw: recorded/replayed command (see paint95-core.js)
+function redo() { return window.P95.cmd("redo", [], redo_impl); }
+function redo_impl() {
 	if (redos.length < 1) {
 		if ($document_history_prompt_window) {
 			$document_history_prompt_window.close();
@@ -2338,7 +2378,13 @@ function show_document_history() {
  * @param {boolean} [going_to_history_node]
  * @param {boolean} [discard_document_state]
  */
-function cancel(going_to_history_node, discard_document_state) {
+// 2draw: recorded/replayed command (see paint95-core.js)
+/**
+ * @param {boolean} [going_to_history_node]
+ * @param {boolean} [discard_document_state]
+ */
+function cancel(going_to_history_node, discard_document_state) { return window.P95.cmd("cancel", [!!going_to_history_node, !!discard_document_state], cancel_impl); }
+function cancel_impl(going_to_history_node, discard_document_state) {
 	if (!history_node_to_cancel_to) {
 		return;
 	}
@@ -2417,6 +2463,21 @@ function meld_textbox_into_canvas(going_to_history_node) {
 			icon: get_icon_for_tool(get_tool_by_id(TOOL_TEXT)),
 		}, () => {
 			main_ctx.drawImage(textbox.canvas, textbox.x, textbox.y);
+			// 2draw: text rendering depends on the machine's fonts, so the recorder stores the result and replay uses it.
+			const rx = Math.max(0, textbox.x);
+			const ry = Math.max(0, textbox.y);
+			const rw = Math.min(main_canvas.width, textbox.x + textbox.canvas.width) - rx;
+			const rh = Math.min(main_canvas.height, textbox.y + textbox.canvas.height) - ry;
+			if (rw > 0 && rh > 0) {
+				if (window.P95.replaying) {
+					const snapshot = window.P95.take("text");
+					if (snapshot) {
+						main_ctx.putImageData(snapshot.image_data, snapshot.x, snapshot.y);
+					}
+				} else {
+					window.P95.put("text", { x: rx, y: ry, image_data: main_ctx.getImageData(rx, ry, rw, rh) });
+				}
+			}
 			textbox.destroy();
 			textbox = null;
 		});
@@ -2428,7 +2489,12 @@ function meld_textbox_into_canvas(going_to_history_node) {
 /**
  * @param {boolean} [going_to_history_node]
  */
-function deselect(going_to_history_node) {
+// 2draw: recorded/replayed command (see paint95-core.js)
+/**
+ * @param {boolean} [going_to_history_node]
+ */
+function deselect(going_to_history_node) { return window.P95.cmd("deselect", [!!going_to_history_node], deselect_impl); }
+function deselect_impl(going_to_history_node) {
 	if (selection) {
 		meld_selection_into_canvas(going_to_history_node);
 	}
@@ -2443,7 +2509,9 @@ function deselect(going_to_history_node) {
 /**
  * @param {{name?: string, icon?: HTMLImageElement | HTMLCanvasElement}} [meta] - overrides certain properties of ActionMetadata
  */
-function delete_selection(meta = {}) {
+// 2draw: recorded/replayed command (see paint95-core.js)
+function delete_selection(meta = {}) { return window.P95.cmd("delete_selection", [meta.name ?? null], () => delete_selection_impl(meta)); }
+function delete_selection_impl(meta = {}) {
 	if (selection) {
 		undoable({
 			name: meta.name || localize("Clear Selection"), //"Delete", (I feel like "Clear Selection" is unclear, could mean "Deselect")
@@ -2455,7 +2523,9 @@ function delete_selection(meta = {}) {
 		});
 	}
 }
-function select_all() {
+// 2draw: recorded/replayed command (see paint95-core.js)
+function select_all() { return window.P95.cmd("select_all", [], select_all_impl); }
+function select_all_impl() {
 	deselect();
 	select_tool(get_tool_by_id(TOOL_SELECT));
 
@@ -2629,7 +2699,9 @@ async function edit_paste(execCommandFallback) {
 	}
 }
 
-function image_invert_colors() {
+// 2draw: recorded/replayed command (see paint95-core.js)
+function image_invert_colors() { return window.P95.cmd("invert_colors", [], image_invert_colors_impl); }
+function image_invert_colors_impl() {
 	apply_image_transformation({
 		name: localize("Invert Colors"),
 		icon: get_help_folder_icon("p_invert.png"),
@@ -2643,7 +2715,9 @@ function image_invert_colors() {
 	});
 }
 
-function clear() {
+// 2draw: recorded/replayed command (see paint95-core.js)
+function clear() { return window.P95.cmd("clear", [], clear_impl); }
+function clear_impl() {
 	deselect();
 	cancel();
 	undoable({
@@ -2810,7 +2884,13 @@ function select_tools(tools) {
  * @param {Tool} tool
  * @param {boolean} [toggle]
  */
-function select_tool(tool, toggle) {
+// 2draw: recorded/replayed command (see paint95-core.js)
+/**
+ * @param {Tool} tool
+ * @param {boolean} [toggle]
+ */
+function select_tool(tool, toggle) { return window.P95.cmd("select_tool", [tool.id, !!toggle], () => select_tool_impl(tool, toggle)); }
+function select_tool_impl(tool, toggle) {
 	deselect();
 
 	if (!(selected_tools.length === 1 && selected_tool.deselect)) {
@@ -4165,3 +4245,39 @@ window.exit_fullscreen_if_ios = exit_fullscreen_if_ios; // used by app-localizat
 window.get_tool_by_id = get_tool_by_id; // used by app-state.js
 window.make_monochrome_palette = make_monochrome_palette; // used by app-state.js
 window.sanity_check_blob = sanity_check_blob; // used by electron-injected.js
+
+// 2draw: command implementations for replay (see paint95-core.js, paint95-replay.js)
+window.P95.register({
+	undo: () => undo_impl(),
+	redo: () => redo_impl(),
+	cancel: (going_to_history_node, discard_document_state) => cancel_impl(going_to_history_node, discard_document_state),
+	deselect: (going_to_history_node) => deselect_impl(going_to_history_node),
+	delete_selection: (name) => delete_selection_impl(name ? { name } : {}),
+	select_all: () => select_all_impl(),
+	clear: () => clear_impl(),
+	invert_colors: () => image_invert_colors_impl(),
+	paste: (blob_index, x, y) => paste_impl(window.P95.player.blob_canvas(blob_index), x, y),
+	go_to_history_node: (id, canceling) => {
+		const node = history_nodes_by_id.get(id);
+		if (node) {
+			go_to_history_node_impl(node, canceling);
+		} else {
+			window.P95.player?.drift_note(`history node ${id} not found`);
+		}
+	},
+	select_tool: (id, toggle) => select_tool_impl(get_tool_by_id(id), toggle),
+	new_document: () => new_document_impl(),
+});
+window.P95.reset_history_keeping_canvas = () => {
+	undos.length = 0;
+	redos.length = 0;
+	history_node_counter = 0;
+	history_nodes_by_id.clear();
+	current_history_node = root_history_node = make_history_node({
+		name: localize("New"),
+		icon: get_help_folder_icon("p_blank.png"),
+		image_data: main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height),
+	});
+	history_node_to_cancel_to = null;
+	$G.triggerHandler("history-update");
+};

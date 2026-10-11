@@ -788,8 +788,9 @@ const tools = [{
 	paint_mask(ctx, x, y) {
 		const r = airbrush_size / 2;
 		for (let i = 0; i < 6 + r / 5; i++) {
-			const rx = (Math.random() * 2 - 1) * r;
-			const ry = (Math.random() * 2 - 1) * r;
+			// 2draw: seeded PRNG so recorded drawings replay identically
+			const rx = (window.P95.random() * 2 - 1) * r;
+			const ry = (window.P95.random() * 2 - 1) * r;
 			const d = rx * rx + ry * ry;
 			if (d <= r * r) {
 				ctx.fillRect(x + ~~rx, y + ~~ry, 1, 1);
@@ -1036,7 +1037,7 @@ const tools = [{
 			}
 		}
 
-		this.last_click_pointerup = { x, y, time: +(new Date()) };
+		this.last_click_pointerup = { x, y, time: window.P95.now() };
 
 		this.updateStatus();
 	},
@@ -1058,7 +1059,7 @@ const tools = [{
 			const lt = this.last_click_pointerdown.time;
 			const dx = x - lx;
 			const dy = y - ly;
-			const dt = +(new Date()) - lt;
+			const dt = window.P95.now() - lt; // 2draw: virtual clock for replay
 			const d = Math.sqrt(dx * dx + dy * dy);
 			if (d < 4.1010101 && dt < 250) { // arbitrary 101 (@TODO: find correct value (or formula))
 				this.complete(ctx);
@@ -1067,7 +1068,7 @@ const tools = [{
 				this.points.push({ x, y });
 			}
 		}
-		this.last_click_pointerdown = { x, y, time: +new Date() };
+		this.last_click_pointerdown = { x, y, time: window.P95.now() };
 	},
 	paint(_ctx, x, y) {
 		if (this.points.length < 1) { return; }
