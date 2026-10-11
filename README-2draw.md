@@ -27,15 +27,33 @@ The same-origin parent page may define:
 
 ```js
 window.paint95Host = {
-	// Called by "Submit to 2draw" with a PNG of exactly w×h.
+	// Called by "Submit to 2draw" with a PNG of exactly w×h, and the recording of the drawing (.p95) if available.
 	// Resolve after uploading (and navigate away); reject with an Error to show it to the user.
-	submit(blob) { /* ... */ },
+	submit(pngBlob, { animation } = {}) { /* ... */ },
 	// Optional: called once the app has loaded.
 	ready() { /* ... */ },
 };
 ```
 
 Without a host (standalone), Submit downloads the PNG.
+
+- `anim` (optional): URL of the previous `.p95` when editing an existing drawing; the new recording continues it.
+
+## Animations
+
+The editor records the drawing as input (pointer events in canvas pixels, tool changes, commands) and the player replays it
+in the same engine. Format and determinism notes: [docs/2draw-animation-format.md](docs/2draw-animation-format.md).
+
+```html
+<script src="/applet/paint95/player.js"></script>
+<script>
+	const player = new Paint95Player({ domRoot, lsaUrl: "/path/to/drawing.p95", fit: "contain", controls: false, autoplay: true });
+	// player.ready, .duration, .currentTime, .isPlaying, .play(), .pause(), .seek(ms), .setSpeed(x)
+</script>
+```
+
+Test: `npm run test:2draw-replay` (records sessions with every tool through Playwright, replays them, and checks the
+canvas is pixel-identical; add `-- --dist` to test `dist-2draw/`, `--typical` for a minute-long session).
 
 "Submit to 2draw" is at the top of the File menu (Ctrl+Enter), and as a button at the right end of the menu bar.
 If the picture's size has changed (e.g. Flip/Rotate or Stretch/Skew), Submit asks, then crops/pads it onto white at w×h.
@@ -46,7 +64,8 @@ If the picture's size has changed (e.g. Flip/Rotate or Stretch/Skew), Submit ask
   Manage Storage, project news and update checks, CORS proxy fallbacks, themes, languages (English only),
   speech recognition, head tracker / dwell clicker, Help Topics, Konami code easter egg, external links.
 - File > Download PNG saves a copy; File > New clears to a blank w×h canvas.
-- No network requests besides the app's own files and the `load` image.
+- No network requests besides the app's own files and the `load`/`anim` files.
+- Polygons, ellipses and curves are rasterized in software instead of WebGL (identical everywhere, works without WebGL).
 - Touch screens show the Quick Undo button and zoom out so the whole picture fits.
-- The 2draw-specific code is in `src/paint95-params.js`, `src/paint95-2draw.js`, `styles/paint95-2draw.css`,
-  and `scripts/build-2draw.mjs`; other changes are marked with `2draw:` comments.
+- The 2draw-specific code is in `src/paint95-*.js`, `player.js`, `styles/paint95-2draw.css`,
+  `scripts/build-2draw.mjs` and `scripts/test-2draw-replay.mjs`; other changes are marked with `2draw:` comments.
