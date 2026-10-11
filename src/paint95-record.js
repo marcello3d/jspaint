@@ -181,12 +181,15 @@ export class Recorder {
 
 	/**
 	 * Called at the start of each recorded event: records state changes, and a keyframe hash if due.
+	 * @param {boolean} [check_state] - (state can only change between pointer moves through UI events, which record it themselves)
 	 * @returns {number} the event time
 	 */
-	begin_event() {
+	begin_event(check_state = true) {
 		const t = Math.max(this.last_t, Math.round(this.now()));
 		window.P95.event_time = t;
-		this.record_state_changes(t);
+		if (check_state) {
+			this.record_state_changes(t);
+		}
 		if (window.P95.debug && !this.stopped) {
 			// debugging divergence: hash before every event
 			const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
@@ -294,7 +297,7 @@ export class Recorder {
 					return;
 				}
 			}
-			const t = this.begin_event();
+			const t = this.begin_event(e.type !== "pointermove");
 			const [x, y] = this.canvas_coords(e);
 			const mods = (e.ctrlKey ? 1 : 0) | (e.shiftKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
 			const pressure = Math.round((e.pressure || 0) * 255);
@@ -373,7 +376,7 @@ export class Recorder {
 			fn();
 			return;
 		}
-		const t = this.begin_event();
+		const t = this.begin_event(false);
 		this.push(t, "k");
 		const was = window.P95.in_dispatch;
 		window.P95.in_dispatch = true;
