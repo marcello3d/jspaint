@@ -42,7 +42,7 @@ if (isIE) {
 		"	.logo { position: relative; top: 3px; }" +
 		"</style>" +
 		'<div className="not-supported">' +
-		'	<h1><img src="images/icons/32x32.png" class="logo"> JS Paint</h1>' +
+		'	<h1>2draw Paint 95</h1>' +
 		"	<h2>Internet Explorer is not supported!</h2>" +
 		'	<p className="not-supported-details">' +
 		"		Try " +
@@ -50,10 +50,6 @@ if (isIE) {
 		'		<a href="https://www.google.com/chrome/">Chrome</a>, ' +
 		"		or " +
 		'		<a href="https://www.microsoft.com/edge/">Edge</a>.' +
-		"	</p>" +
-		"	<hr>" +
-		"	<p>" +
-		'		<a href="about.html">More about JS Paint</a>' +
 		"	</p>" +
 		"</div>";
 	// Wait for body to exist.

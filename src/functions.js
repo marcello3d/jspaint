@@ -12,7 +12,6 @@ import { default_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
 import { $G, E, TAU, debounce, from_canvas_coords, get_help_folder_icon, get_icon_for_tool, get_rgba_from_color, is_discord_embed, is_pride_month, make_canvas, render_access_key, to_canvas_coords } from "./helpers.js";
 import { apply_image_transformation, draw_grid, draw_selection_box, flip_horizontal, flip_vertical, invert_monochrome, invert_rgb, rotate, stretch_and_skew, threshold_black_and_white } from "./image-manipulation.js";
-import { show_imgur_uploader } from "./imgur.js";
 import { showMessageBox } from "./msgbox.js";
 import { localStore } from "./storage.js";
 import { TOOL_CURVE, TOOL_FREE_FORM_SELECT, TOOL_POLYGON, TOOL_SELECT, TOOL_TEXT, tools } from "./tools.js";
@@ -743,11 +742,7 @@ function make_history_node({
 }
 
 function update_title() {
-	document.title = `${file_name} - ${is_pride_month ? "June Solidarity " : ""}${localize("Paint")}`;
-
-	if (is_pride_month) {
-		$("link[rel~='icon']").attr("href", "./images/icons/gay-es-paint-16x16-light-outline.png");
-	}
+	document.title = `${file_name} - 2draw Paint 95`;
 
 	if (window.setRepresentedFilename) {
 		window.setRepresentedFilename(system_file_handle ?? "");
@@ -834,14 +829,9 @@ async function load_image_from_uri(uri) {
 		throw error;
 	}
 
-	const uris_to_try = (is_download && !is_localhost) ? [
-		uri,
-		// work around CORS headers not sent by whatever server
-		`https://cors.bridged.cc/${uri}`,
-		`https://jspaint-cors-proxy.herokuapp.com/${uri}`,
-		// if the image isn't available on the live web, see if it's archived
-		`https://web.archive.org/${uri}`,
-	] : [uri];
+	// 2draw: no third-party CORS proxies or archive fallbacks; only ever request the given URI.
+	void is_localhost;
+	const uris_to_try = [uri];
 	const fails = [];
 
 	for (let index_to_try = 0; index_to_try < uris_to_try.length; index_to_try += 1) {
@@ -1020,7 +1010,7 @@ function open_from_file(file, source_file_handle) {
 
 	if (file instanceof File && file.name.match(/\.theme(pack)?$/i)) {
 		file.text().then(load_theme_from_text, (error) => {
-			show_error_message(localize("Paint cannot open this file."), error);
+			show_error_message("2draw Paint 95 cannot open this file.", error);
 		});
 		return;
 	}
@@ -1074,7 +1064,7 @@ function apply_file_format_and_palette_info(info) {
 function load_theme_from_text(fileText) {
 	var cssProperties = parseThemeFileString(fileText);
 	if (!cssProperties) {
-		show_error_message(localize("Paint cannot open this file."));
+		show_error_message("2draw Paint 95 cannot open this file.");
 		return;
 	}
 	applyCSSProperties(cssProperties, { recurseIntoIframes: true });
@@ -1085,12 +1075,23 @@ function load_theme_from_text(fileText) {
 }
 
 function file_new() {
-	are_you_sure(() => {
+	// 2draw: File > New clears to a blank white canvas of the size this drawing must be.
+	showMessageBox({
+		message: "Clear the picture and start over?",
+		iconID: "warning",
+		buttons: [
+			{ label: localize("OK"), value: "ok", default: true },
+			{ label: localize("Cancel"), value: "cancel" },
+		],
+	}).then((result) => {
+		if (result !== "ok") {
+			return;
+		}
 		deselect();
 		cancel();
 
-		$G.triggerHandler("session-update"); // autosave old session
-		new_local_session();
+		my_canvas_width = window.paint95_required_width ?? my_canvas_width;
+		my_canvas_height = window.paint95_required_height ?? my_canvas_height;
 
 		reset_file();
 		reset_selected_colors();
@@ -1190,6 +1191,14 @@ async function confirm_overwrite_capability() {
 
 function file_save(maybe_saved_callback = () => { }, update_from_saved = true) {
 	deselect();
+	if (window.paint95_lock_size) {
+		// 2draw: "Save" just downloads a PNG copy; the real destination is Submit to 2draw.
+		main_canvas.toBlob((blob) => {
+			saveAs(blob, `${file_name.replace(/\.(bmp|dib|a?png|gif|jpe?g|jpe|jfif|tiff?|webp|raw)$/i, "")}.png`);
+			maybe_saved_callback();
+		}, "image/png");
+		return;
+	}
 	// store and use file handle at this point in time, to avoid race conditions
 	const save_file_handle = system_file_handle;
 	if (!save_file_handle || file_name.match(/\.(svg|pdf)$/i)) {
@@ -1263,6 +1272,24 @@ function file_print() {
  * @param {boolean} [from_session_load]
  */
 function are_you_sure(action, canceled, from_session_load) {
+	// 2draw: there is no saving to disk; just confirm discarding the current picture.
+	if (!saved) {
+		showMessageBox({
+			message: "Discard the current picture?",
+			iconID: "warning",
+			buttons: [
+				{ label: localize("OK"), value: "ok", default: true },
+				{ label: localize("Cancel"), value: "cancel" },
+			],
+		}).then((result) => {
+			if (result === "ok") {
+				action();
+			} else {
+				canceled?.();
+			}
+		});
+		return;
+	}
 	if (saved) {
 		action();
 	} else if (from_session_load) {
@@ -1481,7 +1508,7 @@ function show_resource_load_error_message(error) {
  */
 function show_file_format_errors({ as_image_error, as_palette_error }) {
 	let html = `
-		<p>${localize("Paint cannot open this file.")}</p>
+		<p>${"2draw Paint 95 cannot open this file."}</p>
 	`;
 	if (as_image_error) {
 		// TODO: handle weird errors, only show invalid format error if that's what happened
@@ -1547,34 +1574,21 @@ let $latest_news = $this_version_news;
 // not included directly in the HTML as a simple way of not showing it if it's loaded with fetch
 // (...not sure how to phrase this clearly and concisely...)
 // "Showing the news as of this version of JS Paint. For the latest, see <a href='https://jspaint.app'>jspaint.app</a>"
-if (location.origin !== "https://jspaint.app") {
-	$this_version_news.prepend(
-		$("<p>For the latest news, visit <a href='https://jspaint.app'>jspaint.app</a></p>")
-			.css({ padding: "8px 15px" })
-	);
-}
 
 function show_about_paint() {
 	if ($about_paint_window) {
 		$about_paint_window.close();
 	}
 	$about_paint_window = $Window({
-		title: localize("About Paint"),
+		title: "About 2draw Paint 95",
 		resizable: false,
 		maximizeButton: false,
 		minimizeButton: false,
 	});
 	$about_paint_window.addClass("about-paint squish");
-	if (is_pride_month) {
-		$("#about-paint-icon").attr("src", "./images/icons/gay-es-paint-128x128.png");
-	}
 
 	$about_paint_window.$content.append($about_paint_content.show()).css({ padding: "15px" });
 
-	$("#jspaint-update-status-area").removeAttr("hidden");
-
-	$("#failed-to-check-if-outdated").attr("hidden", "hidden");
-	$("#outdated").attr("hidden", "hidden");
 
 	$about_paint_window.$Button(localize("OK"), () => {
 		$about_paint_window.close();
@@ -1586,17 +1600,6 @@ function show_about_paint() {
 			marginBottom: "10px",
 		});
 
-	$("#refresh-to-update").on("click", (event) => {
-		event.preventDefault();
-		are_you_sure(() => {
-			exit_fullscreen_if_ios();
-			location.reload();
-		});
-	});
-
-	$("#view-project-news").on("click", () => {
-		show_news();
-	});//.focus();
 
 	// Hack to avoid mis-centering within small screens,
 	// due to dynamic width of window when it abuts the right side of the screen
@@ -1605,78 +1608,7 @@ function show_about_paint() {
 	$about_paint_window.css({ left: -innerWidth, top: -innerHeight });
 	$about_paint_window.center();
 
-	if (is_discord_embed) {
-		// No checking for updates in the Discord Activity for now at least.
-		// It's sandboxed, so it can't fetch the news without some extra server logic to proxy it,
-		// and since there will be one official version of the Discord Activity,
-		// the user isn't responsible for updating it.
-
-		// Might be cute to say "This product is licensed to <Discord User>",
-		// since we have the API for that.
-		return;
-	}
-
-	$("#checking-for-updates").removeAttr("hidden");
-
-	// Forward compatibility note: I could change what's served at /?news and remove the news from the HTML,
-	// but I've only added this query string on 2024-04-12, so I may not choose to take advantage of this.
-	// I wish I had used a separate URL from the beginning, maybe a proper blog with an RSS feed.
-	// It's somewhat unsustainable to add news continuously to the HTML of the app,
-	// especially when images are requested even though the container is hidden. (https://github.com/1j01/jspaint/issues/320)
-	// Also note: as long as I preserve the basic structure of the news entries at /, I should be able to
-	// have old versions of the app still say they're outdated, and I could include some short message instead of full news articles.
-	// Maybe I could even include the news in an iframe, just for old versions of the app, within the latest `.news-entry`...
-	// as long as it doesn't have the same problem as images, of loading in the background.
-	const url =
-		// ".";
-		// "test-news-newer.html";
-		"https://jspaint.app/?news";
-	fetch(url)
-		.then((response) => response.text())
-		.then((text) => {
-			const parser = new DOMParser();
-			const htmlDoc = parser.parseFromString(text, "text/html");
-			$latest_news = $(htmlDoc).find("#news");
-
-			const $latest_entries = $latest_news.find(".news-entry");
-			const $this_version_entries = $this_version_news.find(".news-entry");
-
-			if (!$latest_entries.length) {
-				$latest_news = $this_version_news;
-				throw new Error(`No news found at fetched site (${url})`);
-			}
-
-			function entries_contains_update($entries, id) {
-				return $entries.get().some((el_from_this_version) =>
-					id === el_from_this_version.id
-				);
-			}
-
-			// @TODO: visibly mark entries that overlap
-			const entries_newer_than_this_version =
-				$latest_entries.get().filter((el_from_latest) =>
-					!entries_contains_update($this_version_entries, el_from_latest.id)
-				);
-
-			const entries_new_in_this_version = // i.e. in development, when updating the news
-				$this_version_entries.get().filter((el_from_latest) =>
-					!entries_contains_update($latest_entries, el_from_latest.id)
-				);
-
-			if (entries_newer_than_this_version.length > 0) {
-				$("#outdated").removeAttr("hidden");
-			} else if (entries_new_in_this_version.length > 0) {
-				$latest_news = $this_version_news; // show this version's news for development
-			}
-
-			$("#checking-for-updates").attr("hidden", "hidden");
-			update_css_classes_for_conditional_messages();
-		}).catch((exception) => {
-			$("#failed-to-check-if-outdated").removeAttr("hidden");
-			$("#checking-for-updates").attr("hidden", "hidden");
-			update_css_classes_for_conditional_messages();
-			window.console?.log("Couldn't check for updates.", exception);
-		});
+	// 2draw: no update checks / news fetches.
 }
 
 function exit_fullscreen_if_ios() {
@@ -1818,7 +1750,11 @@ async function choose_file_to_paste() {
  */
 function paste(img_or_canvas) {
 
-	if (img_or_canvas.width > main_canvas.width || img_or_canvas.height > main_canvas.height) {
+	// 2draw: the canvas size is fixed, so never offer to enlarge it for a paste.
+	// (The pasted selection can hang off the edge; it gets clipped when it's melded in.)
+	if (window.paint95_lock_size) {
+		do_the_paste();
+	} else if (img_or_canvas.width > main_canvas.width || img_or_canvas.height > main_canvas.height) {
 		const message = localize("The image in the clipboard is larger than the bitmap.") + "\n" +
 			localize("Would you like the bitmap enlarged?");
 		showMessageBox({
@@ -1954,12 +1890,6 @@ function render_history_as_gif() {
 				// revoking on image load(+error) breaks right click > "Save image as" and "Open image in new tab"
 				URL.revokeObjectURL(blob_url);
 			});
-			$win.$Button("Upload to Imgur", () => {
-				$win.close();
-				sanity_check_blob(blob, () => {
-					show_imgur_uploader(blob);
-				});
-			}).focus();
 			$win.$Button(localize("Save"), () => {
 				$win.close();
 				sanity_check_blob(blob, () => {
@@ -2690,10 +2620,10 @@ async function edit_paste(execCommandFallback) {
 						});
 					} else {
 						// @TODO: should I just make a textbox instead?
-						show_error_message("The information on the Clipboard can't be inserted into Paint.");
+						show_error_message("The information on the Clipboard can't be inserted into the picture.");
 					}
 				} else {
-					show_error_message("The information on the Clipboard can't be inserted into Paint.");
+					show_error_message("The information on the Clipboard can't be inserted into the picture.");
 				}
 			} catch (error) {
 				show_error_message(localize("Error getting the Clipboard Data!"), error);
@@ -3917,7 +3847,8 @@ function read_image_file(blob, callback) {
 		}
 		if (!detected_type_id) {
 			if (String.fromCharCode(...file_bytes.slice(0, 1024)).includes("%PDF")) {
-				detected_type_id = "pdf";
+				// 2draw: pdf.js is not shipped in the 2draw build
+				if (window["pdfjs-dist/build/pdf"]) detected_type_id = "pdf";
 			}
 		}
 		if (detected_type_id === "bmp") {
@@ -4093,7 +4024,7 @@ function read_image_file(blob, callback) {
 function update_from_saved_file(blob) {
 	read_image_file(blob, (error, info) => {
 		if (error) {
-			show_error_message("The file has been saved, however... " + localize("Paint cannot read this file."), error);
+			show_error_message("The file has been saved, however... " + "2draw Paint 95 cannot read this file.", error);
 			return;
 		}
 		apply_file_format_and_palette_info(info);

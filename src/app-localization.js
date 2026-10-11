@@ -1021,13 +1021,9 @@
 		return language_names[language][1][0];
 	}
 
+	// 2draw: English only (the localization files are not shipped).
 	let current_language = base_language;
-	for (const accepted_language of accepted_languages) {
-		if (available_languages.indexOf(accepted_language) !== -1) {
-			current_language = accepted_language;
-			break;
-		}
-	}
+	void accepted_languages;
 
 	function get_language() {
 		return current_language;

@@ -16,8 +16,9 @@ const default_magnification = 1;
 /** @type {Tool} */
 const default_tool = window.get_tool_by_id(window.TOOL_PENCIL);
 
-const default_canvas_width = 683;
-const default_canvas_height = 384;
+// 2draw: the canvas size comes from the embed parameters (see paint95-params.js)
+const default_canvas_width = window.paint95_required_width ?? 683;
+const default_canvas_height = window.paint95_required_height ?? 384;
 let my_canvas_width = default_canvas_width;
 let my_canvas_height = default_canvas_height;
 

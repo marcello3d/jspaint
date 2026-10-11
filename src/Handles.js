@@ -13,6 +13,7 @@ import { $G, E, make_css_cursor, to_canvas_coords } from "./helpers.js";
  * @param {() => number} [options.get_ghost_offset_left=() => 0]
  * @param {() => number} [options.get_ghost_offset_top=() => 0]
  * @param {boolean} [options.size_only=false]
+ * @param {boolean} [options.locked=false] - show the handles but don't allow resizing (2draw: fixed canvas size)
  * @param {() => { x: number, y: number, width: number, height: number }} options.get_rect
  * @param {(rect: { x: number, y: number, width: number, height: number }) => void} options.set_rect
  * @param {(rect: { x: number, y: number, width: number, height: number }, x_axis: -1 | 0 | 1, y_axis: -1 | 0 | 1) => { x: number, y: number, width: number, height: number }} [options.constrain_rect]
@@ -31,6 +32,7 @@ function Handles(options) {
 	const get_ghost_offset_left = options.get_ghost_offset_left || (() => 0);
 	const get_ghost_offset_top = options.get_ghost_offset_top || (() => 0);
 	const size_only = options.size_only || false;
+	const locked = options.locked || false;
 
 	/** @type {-1 | 0 | 1} */
 	const HANDLE_MIDDLE = 0;
@@ -72,7 +74,7 @@ function Handles(options) {
 		let dragged = false;
 		const resizes_height = y_axis !== HANDLE_MIDDLE;
 		const resizes_width = x_axis !== HANDLE_MIDDLE;
-		if (size_only && (y_axis === HANDLE_TOP || x_axis === HANDLE_LEFT)) {
+		if (locked || (size_only && (y_axis === HANDLE_TOP || x_axis === HANDLE_LEFT))) {
 			$h.addClass("useless-handle");
 			$grab_region.remove();
 		} else {

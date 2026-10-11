@@ -295,7 +295,7 @@ const tools = [{
 				// for silly multitools feature
 				meld_selection_into_canvas();
 			}
-			if (ctrl) {
+			if (ctrl && !window.paint95_lock_size) { // 2draw: no Ctrl+drag crop (fixed canvas size)
 				undoable({ name: "Crop" }, () => {
 					var cropped_canvas = make_canvas(rect_width, rect_height);
 					cropped_canvas.ctx.drawImage(main_canvas, -rect_x, -rect_y);

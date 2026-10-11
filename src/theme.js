@@ -20,23 +20,9 @@ function wait_for_theme_loaded(theme, callback) {
 }
 
 let grinch_button;
-let current_theme;
-try {
-	const grinch = localStorage[disable_seasonal_theme_key] === "true";
-	const is_december = new Date().getMonth() === 11;
-	const running_tests = "Cypress" in window;
-	if (is_december && !grinch && !running_tests) {
-		current_theme = "winter.css"; // overriding theme preference until you disable the seasonal theme
-		wait_for_theme_loaded(current_theme, () => { // could just wait for DOM to load, but theme is needed for the button styling
-			make_grinch_button();
-		});
-	} else {
-		current_theme = localStorage[theme_storage_key] || default_theme;
-	}
-} catch (error) {
-	console.error(error);
-	current_theme = default_theme;
-}
+// 2draw: always start with the classic theme; no seasonal theme, no remembered theme.
+let current_theme = default_theme;
+void disable_seasonal_theme_key;
 
 const theme_link = document.createElement("link");
 theme_link.rel = "stylesheet";
@@ -52,11 +38,9 @@ const get_theme = () => current_theme;
 const set_theme = (theme) => {
 	current_theme = theme;
 
-	try {
-		localStorage[theme_storage_key] = theme;
-		localStorage[disable_seasonal_theme_key] = "true"; // any theme change disables seasonal theme (unless of course you select the seasonal theme)
-		grinch_button?.remove();
-	} catch (_error) { /* ignore */ }
+	// 2draw: themes are not persisted.
+	void theme_storage_key;
+	grinch_button?.remove();
 
 	const signal_theme_load = () => {
 		$(window).triggerHandler("theme-load");
