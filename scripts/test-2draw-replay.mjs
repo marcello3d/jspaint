@@ -479,6 +479,93 @@ if (process.argv.includes("--slow")) {
 }
 const only = process.argv.find((arg) => arg.startsWith("--only="))?.slice("--only=".length);
 
+/**
+ * The 2draw contract end to end: the editor in a host page submits (png, { animation }) with the Submit button;
+ * then a second editor continues it (&load= the png, &anim= the .p95), and the result replays to the same picture.
+ */
+async function test_host_submit_and_continue() {
+	const files = {};
+	const host_html = (query) => `<!doctype html><meta charset="utf-8"><body style="margin:0">
+		<script>
+			window.submissions = [];
+			window.paint95Host = {
+				async submit(png, extra) {
+					const read = (blob) => blob.arrayBuffer().then((b) => Array.from(new Uint8Array(b)));
+					window.submissions.push({ png: await read(png), p95: extra && extra.animation ? await read(extra.animation) : null });
+				},
+			};
+		</script>
+		<iframe src="index.html?${query}" style="border:0;width:1000px;height:680px"></iframe>`;
+	const page = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(page, "continue");
+	await page.route((url) => /\/__(host\d|prev\.png|prev\.p95)$/.test(url.pathname), (route) => {
+		const name = new URL(route.request().url()).pathname.split("/").pop();
+		if (name === "__prev.png") return route.fulfill({ contentType: "image/png", body: files.png });
+		if (name === "__prev.p95") return route.fulfill({ contentType: "application/octet-stream", body: files.p95 });
+		const anim = name === "__host3" ? `${base}/__missing.p95` : `${base}/__prev.p95`;
+		const query = name === "__host1" ? "w=200&h=150" : `w=200&h=150&load=${encodeURIComponent(`${base}/__prev.png`)}&anim=${encodeURIComponent(anim)}`;
+		return route.fulfill({ contentType: "text/html", body: host_html(query) });
+	});
+	const draw_in_frame = async (frame, points, tool) => {
+		await frame.waitForFunction(() => window.P95 && window.P95.recorder);
+		await frame.click(`.tools-component .tool[title="${tool}"]`);
+		const box = await (await frame.$(".main-canvas")).boundingBox();
+		const scale = box.width / 200;
+		await page.mouse.move(box.x + points[0][0] * scale, box.y + points[0][1] * scale);
+		await page.mouse.down();
+		for (const [x, y] of points.slice(1)) {
+			await page.mouse.move(box.x + x * scale, box.y + y * scale, { steps: 4 });
+		}
+		await page.mouse.up();
+	};
+	const submit = async (frame) => {
+		await frame.click(".paint95-submit-button");
+		await page.waitForFunction(() => window.submissions.length > 0);
+		return page.evaluate(() => window.submissions[0]);
+	};
+	const frame_of = async () => (await page.waitForSelector("iframe")).contentFrame();
+
+	// session 1
+	await page.goto(`${base}/__host1`);
+	let frame = await frame_of();
+	await draw_in_frame(frame, [[20, 20], [120, 60], [60, 120]], "Brush");
+	await draw_in_frame(frame, [[150, 20], [180, 120]], "Airbrush");
+	const first = await submit(frame);
+	check(!!first.p95, "continue: host received an animation with the first submit");
+	check(first.p95 && String.fromCharCode(...first.p95.slice(0, 4)) === "P95A", "continue: animation has the P95A magic");
+	files.png = Buffer.from(first.png);
+	files.p95 = Buffer.from(first.p95);
+
+	// session 2, continuing
+	await page.goto(`${base}/__host2`);
+	frame = await frame_of();
+	await draw_in_frame(frame, [[30, 100], [190, 140]], "Line");
+	await draw_in_frame(frame, [[100, 10], [190, 80]], "Ellipse");
+	const second = await submit(frame);
+	const editor_pixels = await frame.evaluate(() => Array.from(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height).data));
+
+	// session 3: the previous animation can't be loaded -> fresh recording starting from the load image
+	await page.goto(`${base}/__host3`);
+	frame = await frame_of();
+	await draw_in_frame(frame, [[10, 140], [190, 10]], "Pencil");
+	const third = await submit(frame);
+	const p95_3 = Buffer.from(third.p95);
+	const header_3 = JSON.parse(zlib.inflateSync(p95_3.subarray(12, 12 + p95_3.readUInt32LE(8))).toString());
+	check(header_3.segments.length === 1 && header_3.segments[0].start.type === "image", `continue: missing previous animation -> fresh recording with the load image (${header_3.segments.map((x) => x.start.type)})`);
+	await page.close();
+	check(!!second.p95, "continue: host received an animation with the second submit");
+	const p95 = Buffer.from(second.p95);
+	const header = JSON.parse(zlib.inflateSync(p95.subarray(12, 12 + p95.readUInt32LE(8))).toString());
+	check(header.segments.length === 2 && header.segments[1].start.type === "continue", `continue: the new file holds both sessions (${header.segments.map((x) => x.start.type)})`);
+	console.log(`continue: ${p95.length} bytes for 2 sessions`);
+
+	const player_page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(player_page, "continue/player");
+	const replay = await replay_session(player_page, { base64: p95.toString("base64") });
+	await player_page.close();
+	compare("continue", { width: 200, height: 150, pixels: editor_pixels }, replay);
+}
+
 try {
 	for (const [name, script] of Object.entries(sessions)) {
 		if (only && !name.includes(only)) continue;
@@ -496,6 +583,9 @@ try {
 		if (process.env.P95_SAVE) {
 			fs.writeFileSync(path.join(process.env.P95_SAVE, `${name}.p95`), Buffer.from(recording.base64, "base64"));
 		}
+	}
+	if (!only || "continue".includes(only)) {
+		await test_host_submit_and_continue();
 	}
 } finally {
 	await browser.close();
