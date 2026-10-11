@@ -3,7 +3,7 @@
 // JSPaint.exe: replays a recorded drawing (.p95) in this same engine. Active with index.html?replay=1.
 // Driven by player.js through window.paint95Replay. See docs/2draw-animation-format.md
 
-import { cancel, deselect, get_tool_by_id, reset_canvas_and_history, reset_selected_colors, select_tools, set_magnification, update_canvas_rect } from "./functions.js";
+import { cancel, deselect, get_tool_by_id, render_canvas_view, reset_canvas_and_history, reset_selected_colors, select_tools, set_magnification, update_canvas_rect } from "./functions.js";
 import { $G, make_canvas } from "./helpers.js";
 import { decode_p95, decode_png, hash_image_data } from "./paint95-format.js";
 
@@ -423,12 +423,36 @@ class ReplayController {
 		return null;
 	}
 
-	/** For the player's display */
+	/** The document canvas itself */
+	get_document_canvas() {
+		return main_canvas;
+	}
+
+	/**
+	 * For the player's display: what the user saw, i.e. the document plus in-progress strokes/shape previews
+	 * (which tools draw on a mask or preview canvas until the pointer is released), the floating selection and text box.
+	 * Rendered like the engine's thumbnail view.
+	 */
 	get_frame() {
+		if (!this.view_canvas) {
+			this.view_canvas = make_canvas(1, 1);
+		}
+		const view = this.view_canvas;
+		if (view.width !== main_canvas.width || view.height !== main_canvas.height) {
+			view.width = main_canvas.width;
+			view.height = main_canvas.height;
+			view.ctx.disable_image_smoothing();
+		}
+		try {
+			render_canvas_view(view, 1, 0, 0, false);
+		} catch (error) {
+			console.warn("[replay] failed to render the view", error);
+			view.ctx.drawImage(main_canvas, 0, 0);
+		}
 		return {
-			canvas: main_canvas,
-			selection: selection && selection.canvas ? { canvas: selection.canvas, x: selection.x, y: selection.y } : null,
-			textbox: textbox && textbox.canvas ? { canvas: textbox.canvas, x: textbox.x, y: textbox.y } : null,
+			canvas: view,
+			selection: null, // (included in the view)
+			textbox: null,
 			cursor: this.cursor,
 		};
 	}

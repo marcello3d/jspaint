@@ -254,7 +254,7 @@ async function replay_session(page, recording, { seek_back = false } = {}) {
 		for (let i = 0; i < 20000 && !ended; i++) {
 			await new Promise((resolve) => requestAnimationFrame(resolve));
 		}
-		const canvas = player._controller.get_frame().canvas;
+		const canvas = player._controller.get_document_canvas();
 		const image_data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height);
 		return {
 			ended,
@@ -566,6 +566,93 @@ async function test_host_submit_and_continue() {
 	compare("continue", { width: 200, height: 150, pixels: editor_pixels }, replay);
 }
 
+/**
+ * Regression: the player must show strokes progressively (in-progress strokes live on mask/preview canvases until the
+ * pointer is released). Seeks to the middle of long pencil, brush and rectangle drags and checks for ink in the
+ * player's output canvas.
+ */
+async function test_mid_stroke_ink() {
+	const strokes = [
+		{ tool: "Pencil", y: 40 },
+		{ tool: "Brush", y: 100 },
+		{ tool: "Rectangle", y: 160 },
+	];
+	const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(editor, "midstroke/editor");
+	const recording = await record_session(editor, {
+		width: 320, height: 240, script: async (t) => {
+			for (const { tool, y } of strokes) {
+				await t.tool(tool);
+				const [x0, y0] = await t.at(20, y);
+				await t.page.mouse.move(x0, y0);
+				await t.page.mouse.down();
+				for (let i = 1; i <= 40; i++) {
+					const [x, yy] = await t.at(20 + i * 7, y + (tool === "Rectangle" ? 30 : 0));
+					await t.page.mouse.move(x, yy);
+					await t.page.waitForTimeout(10);
+				}
+				await t.page.mouse.up();
+				await t.page.waitForTimeout(50);
+			}
+		},
+	});
+	await editor.close();
+	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "midstroke/player");
+	await page.route(`${base}/__test_host.html`, (route) => route.fulfill({
+		contentType: "text/html",
+		body: `<!doctype html><meta charset="utf-8"><body style="margin:0"><div id="root" style="width:320px;height:240px"></div><script src="player.js"></script>`,
+	}));
+	await page.goto(`${base}/__test_host.html`, { waitUntil: "load" });
+	const results = await page.evaluate(async ({ base64, strokes }) => {
+		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+		const player = new window.Paint95Player({ domRoot: document.getElementById("root"), lsaUrl: URL.createObjectURL(new Blob([bytes])), fit: "contain" });
+		await player.ready;
+		const controller = player._controller;
+		const events = controller.file.header.segments[0].events;
+		// playback times of each stroke's pointerdown and pointerup
+		const downs = [];
+		const ups = [];
+		for (const entry of controller.timeline) {
+			if (entry.index < 0) continue;
+			const type = events[entry.index][0];
+			if (type === "d") downs.push(entry.t);
+			if (type === "u") ups.push(entry.t);
+		}
+		const out = [];
+		for (let i = 0; i < strokes.length; i++) {
+			const mid = (downs[i] + ups[i]) / 2;
+			player.seek(mid);
+			for (let n = 0; n < 500 && !(player._caught_up && !player._restarting); n++) {
+				await new Promise((resolve) => requestAnimationFrame(resolve));
+			}
+			await new Promise((resolve) => requestAnimationFrame(resolve));
+			const ctx = player._canvas.getContext("2d");
+			const band = ctx.getImageData(0, strokes[i].y - 6, 320, strokes[i].tool === "Rectangle" ? 44 : 12).data;
+			let ink = 0;
+			let ink_right_half = 0;
+			for (let p = 0; p < band.length; p += 4) {
+				if (band[p] < 128 && band[p + 1] < 128 && band[p + 2] < 128) {
+					ink++;
+					if ((p / 4) % 320 >= 240) ink_right_half++; // the stroke goes from x=20 to x=300
+				}
+			}
+			const document_ink = (() => {
+				const doc = controller.get_document_canvas().getContext("2d").getImageData(0, strokes[i].y - 6, 320, 12).data;
+				let count = 0;
+				for (let p = 0; p < doc.length; p += 4) if (doc[p] < 128) count++;
+				return count;
+			})();
+			out.push({ tool: strokes[i].tool, mid, ink, ink_right_half, document_ink });
+		}
+		return out;
+	}, { base64: recording.base64, strokes });
+	await page.close();
+	for (const result of results) {
+		check(result.ink > 0 && result.ink_right_half === 0, `midstroke: ${result.tool} shows partial ink halfway through the stroke (${result.ink} dark pixels, ${result.ink_right_half} past three quarters of the way; document canvas has ${result.document_ink})`);
+	}
+}
+
 try {
 	for (const [name, script] of Object.entries(sessions)) {
 		if (only && !name.includes(only)) continue;
@@ -586,6 +673,9 @@ try {
 	}
 	if (!only || "continue".includes(only)) {
 		await test_host_submit_and_continue();
+	}
+	if (!only || "midstroke".includes(only)) {
+		await test_mid_stroke_ink();
 	}
 } finally {
 	await browser.close();
