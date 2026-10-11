@@ -26,6 +26,8 @@ const exclude = [
 	/^images\/mspaint-win98-reference/, // dev-only reference screenshots (#compare-reference)
 	/^images\/help-viewer-toolbar-icons/, // Help Topics viewer (removed)
 	/^images\/tracky-mouse/, // head tracker (removed)
+	/^images\/windows-(16x16|32x32)\.png$/, // only used by the paste "enlarge the bitmap?" prompt, which is skipped
+	/^images\/help-icons\.png$/, // Help Topics viewer (removed)
 ];
 
 function add(rel) {
@@ -96,7 +98,7 @@ add("lib/gif.js/gif.worker.js"); // Extras > Render History As GIF
 add("audio/chord.wav"); // message box sound
 add_glob("images/cursors", /\.png$/); // make_css_cursor(): `images/cursors/${name}.png`
 add_glob("images/transforms", /\.png$/); // Flip/Rotate & Stretch/Skew dialogs
-add_glob("images", /^(error|warning|info|question|nuke)-(16x16|32x32)-\w+\.(png|svg)$/); // msgbox.js: `images/${iconID}-32x32-8bpp.png`
+add_glob("images", /^(error|warning|info|question)-(16x16|32x32)-\w+\.(png|svg)$/); // msgbox.js: `images/${iconID}-32x32-8bpp.png`
 add_glob("help", /^p_\w+\.(png|gif)$/); // tool & history icons: `help/${file_name}`
 add("images/icons/128x128.png"); // About box
 
