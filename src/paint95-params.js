@@ -1,5 +1,5 @@
 // @ts-check
-// 2draw Paint 95: read the embed parameters before the app initializes.
+// JSPaint.exe: read the embed parameters before the app initializes.
 // index.html?w=<width>&h=<height>[&load=<url-encoded image URL>]
 (() => {
 	const params = new URLSearchParams(location.search);

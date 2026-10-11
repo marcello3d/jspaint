@@ -737,7 +737,7 @@ function make_history_node({
 }
 
 function update_title() {
-	document.title = `${file_name} - 2draw Paint 95`;
+	document.title = `${file_name} - JSPaint.exe`;
 
 	if (window.setRepresentedFilename) {
 		window.setRepresentedFilename(system_file_handle ?? "");
@@ -1005,7 +1005,7 @@ function open_from_file(file, source_file_handle) {
 
 	if (file instanceof File && file.name.match(/\.theme(pack)?$/i)) {
 		file.text().then(load_theme_from_text, (error) => {
-			show_error_message("2draw Paint 95 cannot open this file.", error);
+			show_error_message("JSPaint.exe cannot open this file.", error);
 		});
 		return;
 	}
@@ -1059,7 +1059,7 @@ function apply_file_format_and_palette_info(info) {
 function load_theme_from_text(fileText) {
 	var cssProperties = parseThemeFileString(fileText);
 	if (!cssProperties) {
-		show_error_message("2draw Paint 95 cannot open this file.");
+		show_error_message("JSPaint.exe cannot open this file.");
 		return;
 	}
 	applyCSSProperties(cssProperties, { recurseIntoIframes: true });
@@ -1503,7 +1503,7 @@ function show_resource_load_error_message(error) {
  */
 function show_file_format_errors({ as_image_error, as_palette_error }) {
 	let html = `
-		<p>${"2draw Paint 95 cannot open this file."}</p>
+		<p>${"JSPaint.exe cannot open this file."}</p>
 	`;
 	if (as_image_error) {
 		// TODO: handle weird errors, only show invalid format error if that's what happened
@@ -1575,7 +1575,7 @@ function show_about_paint() {
 		$about_paint_window.close();
 	}
 	$about_paint_window = $Window({
-		title: "About 2draw Paint 95",
+		title: "About JSPaint.exe",
 		resizable: false,
 		maximizeButton: false,
 		minimizeButton: false,
@@ -4019,7 +4019,7 @@ function read_image_file(blob, callback) {
 function update_from_saved_file(blob) {
 	read_image_file(blob, (error, info) => {
 		if (error) {
-			show_error_message("The file has been saved, however... " + "2draw Paint 95 cannot read this file.", error);
+			show_error_message("The file has been saved, however... " + "JSPaint.exe cannot read this file.", error);
 			return;
 		}
 		apply_file_format_and_palette_info(info);

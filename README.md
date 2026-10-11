@@ -1,4 +1,4 @@
-> **2draw fork:** this `2draw` branch is trimmed down and rebranded as "2draw Paint 95" for embedding on 2draw.net. See [README-2draw.md](README-2draw.md).
+> **2draw fork:** this `2draw` branch is trimmed down and rebranded as "JSPaint.exe" for embedding on 2draw.net. See [README-2draw.md](README-2draw.md).
 
 
 # [![](images/icons/32x32.png) JS Paint](https://jspaint.app)

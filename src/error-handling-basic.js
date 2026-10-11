@@ -42,7 +42,7 @@ if (isIE) {
 		"	.logo { position: relative; top: 3px; }" +
 		"</style>" +
 		'<div className="not-supported">' +
-		'	<h1>2draw Paint 95</h1>' +
+		'	<h1>JSPaint.exe</h1>' +
 		"	<h2>Internet Explorer is not supported!</h2>" +
 		'	<p className="not-supported-details">' +
 		"		Try " +

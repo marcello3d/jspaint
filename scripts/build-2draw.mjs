@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Builds dist-2draw/: only the files the trimmed 2draw Paint 95 app needs,
+// Builds dist-2draw/: only the files the trimmed JSPaint.exe app needs,
 // to be vendored by 2draw.net and served from /applet/paint95/.
 //
 // Usage: npm run build:2draw

@@ -1,4 +1,4 @@
-# 2draw Paint 95
+# JSPaint.exe
 
 This branch (`2draw`) is a fork of [JS Paint](https://github.com/1j01/jspaint) by Isaiah Odhner (MIT, see `LICENSE.txt`),
 trimmed down to run as a drawing applet on [2draw.net](https://2draw.net/).

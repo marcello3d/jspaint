@@ -1,6 +1,6 @@
 // @ts-check
 /* global current_history_node:writable, main_canvas, main_ctx, saved:writable, undos, redos */
-// 2draw Paint 95: integration with the 2draw.net draw page.
+// JSPaint.exe: integration with the 2draw.net draw page.
 //
 // Embed contract:
 //   <iframe src="/applet/paint95/index.html?w=<width>&h=<height>[&load=<url-encoded PNG/JPG URL>]">
@@ -130,7 +130,6 @@ async function submit() {
 	} catch (error) {
 		set_busy(false);
 		showMessageBox({
-			title: "Submit to 2draw",
 			message: `The picture could not be submitted.\n\n${(error && error.message) || error}`,
 			iconID: "error",
 		});

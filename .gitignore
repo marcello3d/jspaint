@@ -20,6 +20,6 @@ Thumbs.db
 # temporary files when using git subrepo
 .git-rewrite/
 
-# 2draw Paint 95 build output (vendored by 2draw.net)
+# JSPaint.exe build output (vendored by 2draw.net)
 dist-2draw/
 dist-2draw-screenshot.png

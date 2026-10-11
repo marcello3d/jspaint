@@ -495,7 +495,7 @@ const menus = {
 			],
 			action: () => {
 				const ap = new AnyPalette.Palette();
-				ap.name = "2draw Paint 95 Saved Colors";
+				ap.name = "JSPaint.exe Saved Colors";
 				ap.numberOfColumns = 16; // 14?
 				for (const color of palette) {
 					const [r, g, b] = get_rgba_from_color(color);
@@ -525,7 +525,7 @@ const menus = {
 	],
 	[localize("&Help")]: [
 		{
-			label: "&About 2draw Paint 95",
+			label: "&About JSPaint.exe",
 			action: () => { show_about_paint(); },
 			description: "Displays program information and copyright.",
 		},
