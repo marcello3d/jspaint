@@ -124,6 +124,7 @@
     "electron:publish": "electron-forge publish",
     "release": "node scripts/release/release.js",
     "build:2draw": "node scripts/build-2draw.mjs",
+    "test:2draw-replay": "npx --yes -p playwright-core@1.47.2 node scripts/test-2draw-replay.mjs",
     "lint-cspell": "cspell-cli lint .",
     "lint-tsc": "tsc --noEmit --project jsconfig.json",
     "lint-eslint": "eslint",
