@@ -40,3 +40,16 @@ html, body {
 		min-height: 28px;
 	}
 }
+
+/* Replay mode (index.html?replay=1, driven by player.js): only the canvas */
+.paint95-replay .menus,
+.paint95-replay .component-area,
+.paint95-replay .status-area,
+.paint95-replay .os-window,
+.paint95-replay .tool-window,
+.paint95-replay .paint95-submit-button {
+	display: none !important;
+}
+.paint95-replay .canvas-area {
+	overflow: hidden !important;
+}
