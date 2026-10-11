@@ -123,6 +123,7 @@
     "electron:make": "electron-forge make",
     "electron:publish": "electron-forge publish",
     "release": "node scripts/release/release.js",
+    "build:2draw": "node scripts/build-2draw.mjs",
     "lint-cspell": "cspell-cli lint .",
     "lint-tsc": "tsc --noEmit --project jsconfig.json",
     "lint-eslint": "eslint",

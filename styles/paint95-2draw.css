@@ -29,3 +29,14 @@ html, body {
 .tools-component, .colors-component, .menus {
 	touch-action: manipulation;
 }
+
+/* Touch screens: taller menu bar targets */
+@media (pointer: coarse) {
+	.menus .menu-button {
+		padding-top: 5px;
+		padding-bottom: 5px;
+	}
+	.paint95-submit-button {
+		min-height: 28px;
+	}
+}
