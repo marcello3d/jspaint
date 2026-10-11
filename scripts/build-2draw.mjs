@@ -92,6 +92,7 @@ function scan(rel) {
 add("index.html");
 add("LICENSE.txt");
 add("favicon.ico");
+add("player.js"); // animation player for the host page (loads index.html?replay=1 next to it)
 // Picked at runtime by name:
 add("styles/themes/classic.css"); // theme.js: `styles/themes/${theme}`
 add("lib/gif.js/gif.worker.js"); // Extras > Render History As GIF
