@@ -13,9 +13,10 @@
 //   &anim=<url of a previous .p95> continues that recording (see docs/2draw-animation-format.md).
 //   In replay mode (index.html?replay=1, used by player.js) none of this runs.
 
-import { change_url_param, deselect, load_image_from_uri, set_magnification, show_error_message } from "./functions.js";
+import { change_url_param, deselect, set_magnification, show_error_message } from "./functions.js";
 import { $G, E, make_canvas } from "./helpers.js";
 import { showMessageBox } from "./msgbox.js";
+import { fetch_cors, load_image_cors } from "./paint95-fetch.js";
 import { decode_p95 } from "./paint95-format.js";
 import { Recorder } from "./paint95-record.js";
 
@@ -180,14 +181,13 @@ function init_editor() {
 	// #region Initial picture
 
 	async function load_initial_image(url) {
-		let info;
+		let source;
 		try {
-			info = await load_image_from_uri(url);
+			source = await load_image_cors(url);
 		} catch (error) {
 			show_error_message("The starting picture could not be loaded. You can still draw on a blank canvas.", error);
 			return false;
 		}
-		const source = info.image || make_canvas(info.image_data);
 		main_ctx.fillStyle = "#ffffff";
 		main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height);
 		main_ctx.drawImage(source, 0, 0);
@@ -207,10 +207,7 @@ function init_editor() {
 	 */
 	async function load_previous_animation(url) {
 		try {
-			const response = await fetch(url, { mode: "cors", credentials: "omit" });
-			if (!response.ok) {
-				throw new Error(`HTTP ${response.status}`);
-			}
+			const response = await fetch_cors(url);
 			const file = decode_p95(await response.arrayBuffer());
 			if (file.header.segments.some((segment) => (segment.engine?.behavior ?? 0) > window.P95.ENGINE_BEHAVIOR)) {
 				throw new Error("recorded with a newer version");
