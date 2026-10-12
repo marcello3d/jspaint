@@ -402,8 +402,11 @@ export class ReplayController {
 			}
 		}
 		const rect = window.canvas_bounding_client_rect;
-		const clientX = rect.left + (x + 0.5) * rect.width / main_canvas.width;
-		const clientY = rect.top + (y + 0.5) * rect.height / main_canvas.height;
+		// The engine truncates toward zero (~~): pixel n > 0 came from [n, n + 1), n < 0 from (n - 1, n], and 0 from (-1, 1);
+		// aim for the middle of that range.
+		const center = (n) => (n > 0 ? n + 0.5 : n < 0 ? n - 0.5 : 0);
+		const clientX = rect.left + center(x) * rect.width / main_canvas.width;
+		const clientY = rect.top + center(y) * rect.height / main_canvas.height;
 		const jq_type = { d: "pointerdown", M: "pointermove", m: "pointermove", u: "pointerup", c: "pointercancel" }[type];
 		const props = {
 			clientX, clientY, pageX: clientX, pageY: clientY, screenX: clientX, screenY: clientY,

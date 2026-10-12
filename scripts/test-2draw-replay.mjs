@@ -296,6 +296,8 @@ const sessions = {
 		await t.option(1);
 		await t.color(16, "right");
 		await t.drag([[20, 70], [90, 80], [120, 60]], { button: "right" });
+		// a stroke that leaves the canvas (negative coordinates; the engine truncates toward zero)
+		await t.drag([[30, 30], [10, 12], [-12, -8], [-20, 40], [5, 60]], { button: "right" });
 		// airbrush, held still for a while (timer ticks)
 		await t.tool("Airbrush");
 		await t.color(20);
