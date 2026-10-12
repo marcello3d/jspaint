@@ -43,6 +43,9 @@ can be compared and restored exactly.
        | { type: "image", blob }  // the starting picture (e.g. the `load` image), exact pixels
        | { type: "continue", hash }, // continue from the previous segment's result, cropped/padded onto
                                   //   white width×height (as it was submitted); hash = expected start pixels
+       | { type: "continue", hash, history: true, keep }, // the editor restored the previous sessions' undo
+                                  //   history (see below) and continued from that exact state, after keeping only
+                                  //   the last `keep` undo steps (P95.prune_history)
   events: [Event, ...],
   duration,                       // ms of recording
   truncated?: true,               // events stop early (size cap); the end picture still exists
@@ -113,6 +116,25 @@ events; if it's still too big, no animation is submitted. Submitting the drawing
 The editor gets `&anim=<previous .p95>` along with `&load=<previous png>`. If the file loads (CORS fetch) and its
 format/behavior are known, the new file contains all previous segments plus a new `continue` segment. Otherwise the new
 file starts fresh with the `load` image as an `image` start.
+
+### Restoring the undo history
+
+When revising, the editor replays the previous file's segments itself (`src/paint95-restore.js`, time-sliced, with a
+"Restoring history" box and a Skip button), so undo can step back into earlier sessions. It then checks that the result
+matches the last segment's final hash and the loaded picture, and prunes the history to the last `keep` steps
+(about 256 MB of snapshots, 10–100 steps). The new segment is then `continue` with `history: true`; replay does the same
+prune at that point instead of resetting the history.
+
+It isn't attempted (the editor continues from the flattened picture, as `continue` without `history`) when the file is
+truncated, from a newer engine, changed size, or doesn't end with the loaded picture. If it's attempted and then fails
+(drift, final mismatch, more than 10 s, more than ~600 MB of snapshots, an error, or Skip), the editor reloads itself
+with `&p95nohistory=1` and continues from the picture.
+
+### Loading `load` and `anim`
+
+Both are fetched with CORS, `cache: "no-store"`, and an extra `p95load=1` query parameter (falling back to an
+`<img crossorigin>` with a unique parameter): S3 only sends CORS headers and `Vary: Origin` when a request has an Origin,
+so a response cached from a plain `<img>` on the view page could otherwise be reused for the CORS request and fail.
 
 ## Replay
 

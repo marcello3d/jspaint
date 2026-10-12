@@ -11,5 +11,7 @@
 	window.paint95_required_height = parse_size(params.get("h"), 300);
 	window.paint95_load_url = params.get("load") || null;
 	window.paint95_anim_url = params.get("anim") || null;
+	// set when restoring the undo history from the previous animation failed (paint95-restore.js)
+	window.paint95_no_history = params.has("p95nohistory");
 	window.paint95_lock_size = true;
 })();

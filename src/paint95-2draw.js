@@ -17,7 +17,8 @@ import { change_url_param, deselect, set_magnification, show_error_message } fro
 import { $G, E, make_canvas } from "./helpers.js";
 import { showMessageBox } from "./msgbox.js";
 import { fetch_cors, load_image_cors } from "./paint95-fetch.js";
-import { decode_p95 } from "./paint95-format.js";
+import { decode_p95, hash_image_data } from "./paint95-format.js";
+import { restore_history } from "./paint95-restore.js";
 import { Recorder } from "./paint95-record.js";
 
 // Stand-in for the removed sessions.js (called when opening a file)
@@ -253,9 +254,26 @@ function init_editor() {
 			loaded = await load_initial_image(window.paint95_load_url);
 		}
 		const previous = loaded ? await previous_promise : null;
+		// Revising: replay the previous sessions in the editor so their undo history is back.
+		let history_keep = null;
+		if (previous && !window.paint95_no_history) {
+			const expected_hash = hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height));
+			const result = await restore_history(previous, { width: required_width, height: required_height, expected_hash });
+			if (result.ok) {
+				history_keep = result.keep;
+				set_magnification(1);
+				zoom_out_to_fit();
+			} else if (result.modified) {
+				// Start over cleanly from the picture (the half-restored state can't be trusted).
+				const params = new URLSearchParams(location.search);
+				params.set("p95nohistory", "1");
+				location.replace(`${location.pathname}?${params}${location.hash}`);
+				return;
+			}
+		}
 		try {
 			recorder = new Recorder({ previous });
-			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank" });
+			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank", history_keep });
 		} catch (error) {
 			console.error("Failed to start recording", error);
 			recorder = null;

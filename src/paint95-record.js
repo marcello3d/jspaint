@@ -125,13 +125,18 @@ export class Recorder {
 	/**
 	 * @param {object} options
 	 * @param {"blank" | "image" | "continue"} options.start
+	 * @param {number | null} [options.history_keep] - for "continue": the previous sessions' undo history was restored
+	 *   (and pruned to this many steps), see paint95-restore.js
 	 */
-	begin({ start }) {
+	begin({ start, history_keep = null }) {
 		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 		if (start === "image") {
 			this.segment.start = { type: "image", blob: this.add_blob(image_data) };
 		} else if (start === "continue") {
 			this.segment.start = { type: "continue", hash: hash_image_data(image_data) };
+			if (history_keep != null) {
+				Object.assign(this.segment.start, { history: true, keep: history_keep });
+			}
 		} else {
 			this.segment.start = { type: "blank" };
 		}

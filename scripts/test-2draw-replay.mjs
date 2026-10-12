@@ -198,9 +198,11 @@ async function record_session(page, { width, height, script }) {
 			binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
 		}
 		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+		const png_base64 = main_canvas.toDataURL("image/png").split(",")[1];
 		const events = window.P95.recorder.segment.events;
 		return {
 			base64: btoa(binary),
+			png_base64,
 			size: bytes.length,
 			events: events.length,
 			truncated: !!window.P95.recorder.segment.truncated,
@@ -536,9 +538,26 @@ async function test_host_submit_and_continue() {
 	files.png = Buffer.from(first.png);
 	files.p95 = Buffer.from(first.p95);
 
-	// session 2, continuing
+	// session 2, continuing: the undo history of session 1 is restored; undo past the session boundary, then draw
+	const restore_log = [];
+	page.on("console", (message) => { if (/Restored the undo history|Couldn't restore/.test(message.text())) restore_log.push(message.text()); });
 	await page.goto(`${base}/__host2`);
 	frame = await frame_of();
+	await frame.waitForFunction(() => window.P95 && window.P95.recorder);
+	const restored = await frame.evaluate(() => ({ undos: undos.length, url: location.search }));
+	check(restored.undos >= 2 && !/p95nohistory/.test(restored.url), `continue: session 1's undo history was restored (${restored.undos} undo steps; ${restore_log.join("; ")})`);
+	await draw_in_frame(frame, [[60, 60], [70, 70]], "Pencil");
+	for (let i = 0; i < 3; i++) {
+		await page.keyboard.press("Control+z"); // the pencil stroke, then session 1's airbrush and brush strokes
+	}
+	const after_undo = await frame.evaluate(() => {
+		const data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height).data;
+		let non_white = 0;
+		for (let i = 0; i < data.length; i += 4) if (data[i] !== 255 || data[i + 1] !== 255 || data[i + 2] !== 255) non_white++;
+		return non_white;
+	});
+	check(after_undo === 0, `continue: undoing past the session boundary removes session 1's strokes (${after_undo} non-white pixels left)`);
+	await page.keyboard.press("Control+y"); // redo session 1's brush stroke
 	await draw_in_frame(frame, [[30, 100], [190, 140]], "Line");
 	await draw_in_frame(frame, [[100, 10], [190, 80]], "Ellipse");
 	const second = await submit(frame);
@@ -556,7 +575,7 @@ async function test_host_submit_and_continue() {
 	check(!!second.p95, "continue: host received an animation with the second submit");
 	const p95 = Buffer.from(second.p95);
 	const header = JSON.parse(zlib.inflateSync(p95.subarray(12, 12 + p95.readUInt32LE(8))).toString());
-	check(header.segments.length === 2 && header.segments[1].start.type === "continue", `continue: the new file holds both sessions (${header.segments.map((x) => x.start.type)})`);
+	check(header.segments.length === 2 && header.segments[1].start.type === "continue" && header.segments[1].start.history === true, `continue: the new file holds both sessions (${header.segments.map((x) => x.start.type)})`);
 	console.log(`continue: ${p95.length} bytes for 2 sessions`);
 
 	const player_page = await browser.newPage({ viewport: { width: 800, height: 600 } });
@@ -564,6 +583,32 @@ async function test_host_submit_and_continue() {
 	const replay = await replay_session(player_page, { base64: p95.toString("base64") });
 	await player_page.close();
 	compare("continue", { width: 200, height: 150, pixels: editor_pixels }, replay);
+}
+
+/**
+ * Revising with this recording: how long the editor takes to restore the undo history.
+ */
+async function measure_restore(name, recording, width, height) {
+	const page = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(page, `${name}/restore`);
+	const log = [];
+	page.on("console", (message) => { if (/Restored the undo history|Couldn't restore/.test(message.text())) log.push(message.text()); });
+	await page.route((url) => /\/__r\.(png|p95|html)$/.test(url.pathname), (route) => {
+		const name = new URL(route.request().url()).pathname.split("/").pop();
+		if (name === "__r.png") return route.fulfill({ contentType: "image/png", body: Buffer.from(recording.png_base64, "base64") });
+		if (name === "__r.p95") return route.fulfill({ contentType: "application/octet-stream", body: Buffer.from(recording.base64, "base64") });
+		return route.fulfill({ contentType: "text/html", body: `<!doctype html><body style="margin:0"><iframe src="index.html?w=${width}&h=${height}&load=${encodeURIComponent(`${base}/__r.png`)}&anim=${encodeURIComponent(`${base}/__r.p95`)}" style="border:0;width:1000px;height:680px"></iframe>` });
+	});
+	await page.goto(`${base}/__r.html`);
+	const frame = await (await page.waitForSelector("iframe")).contentFrame();
+	for (let i = 0; i < 600; i++) {
+		const ready = await frame.evaluate(() => !!(window.P95 && window.P95.recorder)).catch(() => false);
+		if (ready) break;
+		await page.waitForTimeout(100);
+	}
+	const state = await frame.evaluate(() => ({ undos: undos.length, url: location.search, start: window.P95.recorder.segment.start }));
+	await page.close();
+	check(state.start.history === true && !/p95nohistory/.test(state.url), `${name}: revising restores the undo history (${state.undos} undo steps; ${log.join("; ")})`);
 }
 
 /**
@@ -667,6 +712,9 @@ try {
 		const replay = await replay_session(player_page, recording, { seek_back: name === "all_tools" });
 		await player_page.close();
 		compare(name, recording, replay);
+		if (name === "all_tools" || name === "typical") {
+			await measure_restore(name, recording, 320, 240);
+		}
 		if (process.env.P95_SAVE) {
 			fs.writeFileSync(path.join(process.env.P95_SAVE, `${name}.p95`), Buffer.from(recording.base64, "base64"));
 		}

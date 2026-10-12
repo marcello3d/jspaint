@@ -4268,6 +4268,47 @@ window.P95.register({
 	select_tool: (id, toggle) => select_tool_impl(get_tool_by_id(id), toggle),
 	new_document: () => new_document_impl(),
 });
+/**
+ * Keeps only the last `keep` undo steps of the current state's ancestry (and everything after them),
+ * to bound memory after restoring a previous session's history. Deterministic: replay does the same.
+ * @param {number} keep
+ */
+window.P95.prune_history = (keep) => {
+	const chain = [];
+	for (let node = current_history_node; node; node = node.parent) {
+		chain.push(node);
+	}
+	chain.reverse();
+	if (chain.length > keep + 1) {
+		const new_root = chain[chain.length - keep - 1];
+		new_root.parent = null;
+		root_history_node = new_root;
+	}
+	const kept = new Set();
+	const stack = [root_history_node];
+	while (stack.length) {
+		const node = stack.pop();
+		kept.add(node);
+		stack.push(...node.futures);
+	}
+	for (const [id, node] of history_nodes_by_id) {
+		if (!kept.has(node)) {
+			history_nodes_by_id.delete(id);
+		}
+	}
+	const kept_undos = undos.filter((node) => kept.has(node));
+	undos.length = 0;
+	undos.push(...kept_undos);
+	const kept_redos = redos.filter((node) => kept.has(node));
+	redos.length = 0;
+	redos.push(...kept_redos);
+	if (history_node_to_cancel_to && !kept.has(history_node_to_cancel_to)) {
+		history_node_to_cancel_to = null;
+	}
+	$G.triggerHandler("history-update");
+};
+/** For the history restore's memory budget */
+window.P95.history_size = () => history_nodes_by_id.size;
 window.P95.reset_history_keeping_canvas = () => {
 	undos.length = 0;
 	redos.length = 0;

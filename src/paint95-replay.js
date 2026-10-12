@@ -11,7 +11,7 @@ import { decode_p95, decode_png, hash_image_data } from "./paint95-format.js";
 const IDLE_CAP = 1000;
 const POINTER_TYPE_NAMES = ["mouse", "pen", "touch"];
 
-class ReplayController {
+export class ReplayController {
 	constructor() {
 		/** @type {import("./paint95-format.js").P95File | null} */
 		this.file = null;
@@ -38,7 +38,14 @@ class ReplayController {
 	 * @param {ArrayBuffer | Uint8Array} buffer
 	 */
 	load(buffer) {
-		this.file = decode_p95(buffer);
+		return this.load_file(decode_p95(buffer));
+	}
+
+	/**
+	 * @param {import("./paint95-format.js").P95File} file
+	 */
+	load_file(file) {
+		this.file = file;
 		const { header } = this.file;
 		const timeline = [];
 		let t = 0;
@@ -167,6 +174,20 @@ class ReplayController {
 		window.paint95_required_height = segment.height;
 		this.pointer_state.clear();
 		this.drifted = false;
+
+		if (segment.start.type === "continue" && segment.start.history && seg > 0) {
+			// The editor restored the previous sessions' undo history (by replaying them) and continued from there.
+			// See paint95-restore.js; this must do exactly what the editor did after restoring.
+			const actual = hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height));
+			if (actual === segment.start.hash && main_canvas.width === segment.width && main_canvas.height === segment.height) {
+				my_canvas_width = segment.width;
+				my_canvas_height = segment.height;
+				window.P95.prune_history(segment.start.keep);
+				return;
+			}
+			this.drift({ type: "start", segment: seg, expected: segment.start.hash, actual });
+			// fall back to continuing from the flattened picture (the history won't match, but keyframes will catch it)
+		}
 
 		if (seg > 0 || segment.start.type === "continue") {
 			// Leave any floating selection/text box from the previous session
