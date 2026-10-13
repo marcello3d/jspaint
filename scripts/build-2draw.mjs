@@ -118,8 +118,13 @@ for (const rel of [...files].sort()) {
 	const dest = path.join(out_dir, rel);
 	fs.mkdirSync(path.dirname(dest), { recursive: true });
 	if (rel === "index.html") {
+		// Preload every ES module up front: otherwise the browser discovers them import by import, a network round
+		// trip per level (2draw: the editor/player loads ~40 modules).
+		const module_files = [...files].filter((f) => f.startsWith("src/") && f.endsWith(".js") && /^\s*(import|export)\s/m.test(fs.readFileSync(path.join(root, f), "utf8")));
+		const preloads = module_files.sort().map((f) => `\t<link rel="modulepreload" href="${f}">`).join("\n");
 		const html = fs.readFileSync(src, "utf8")
-			.replace('<span id="paint95-version">dev</span>', `<span id="paint95-version">${version}</span>`);
+			.replace('<span id="paint95-version">dev</span>', `<span id="paint95-version">${version}</span>`)
+			.replace("</head>", `${preloads}\n</head>`);
 		fs.writeFileSync(dest, html);
 	} else {
 		fs.copyFileSync(src, dest);
