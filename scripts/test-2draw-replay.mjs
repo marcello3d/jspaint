@@ -1099,6 +1099,7 @@ async function test_history_patches_with(name) {
 	});
 	await page.close();
 	check(result.anchor_mismatches === 0 && result.captures.incremental > 5, `patches: ${name}: steps read back only the changed rectangle, and it always matches the canvas (${JSON.stringify(result.captures)}; ${result.anchor_mismatches} mismatches)`);
+	check(result.stats.bytes === result.stats.running_total, `patches: ${name}: the running memory total matches the steps (${result.stats.bytes} vs ${result.stats.running_total})`);
 	check(result.checked > 10 && result.mismatches.length === 0, `patches: ${name}: every history step rebuilds its exact picture (${result.checked} visits of ${result.steps} steps; mismatches ${JSON.stringify(result.mismatches)}; ${(result.stats.bytes / result.stats.steps / 1024).toFixed(1)} KB per step)`);
 }
 
@@ -1145,6 +1146,9 @@ async function test_history_cap() {
 			const stats = await editor.evaluate(() => window.P95.history_stats()).catch(() => null);
 			if (process.argv.includes("--verbose")) console.log("DBG", kind, behavior, await editor.evaluate(() => JSON.stringify(window.P95.history_stats())));
 			await editor.close();
+			if (behavior === 4) {
+				check(stats && stats.bytes === stats.running_total, `historycap: the running memory total matches the steps (${stats && stats.bytes} vs ${stats && stats.running_total})`);
+			}
 			if (behavior === 3) {
 				check(stats && stats.steps <= 2 * 13 + 1, `historycap: behavior 3 caps the history by step count (${stats && stats.steps} steps kept)`);
 			} else if (kind === "strokes") {

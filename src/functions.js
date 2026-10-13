@@ -656,6 +656,7 @@ function reset_canvas_and_history() {
 	redos.length = 0;
 	history_node_counter = 0;
 	history_nodes_by_id.clear();
+	history_bytes_total = 0;
 	history_anchor = null;
 	current_history_node = root_history_node = make_history_node({
 		name: localize("New"),
@@ -726,6 +727,22 @@ function debug_history_snapshot(node) {
 	let h = 0x811c9dc5 ^ image_data.width ^ (image_data.height << 16);
 	for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
 	(window.P95.debug_history_hashes ??= new Map()).set(node.id, h >>> 0);
+}
+
+// Running total of history_node_bytes over the steps in history_nodes_by_id (kept up to date as steps change), so the
+// memory rule doesn't sum every step on every new one.
+let history_bytes_total = 0;
+/** @param {HistoryNode} node - recount after its patch or selection changed */
+function recount_history_node(node) {
+	if (!history_nodes_by_id.has(node.id)) return;
+	const bytes = history_node_bytes(node);
+	history_bytes_total += bytes - (node.counted_bytes || 0);
+	node.counted_bytes = bytes;
+}
+/** @param {HistoryNode} node - removed from history_nodes_by_id */
+function uncount_history_node(node) {
+	history_bytes_total -= node.counted_bytes || 0;
+	node.counted_bytes = 0;
 }
 
 /** make_history_node's image_data for "the canvas, which changed only in the dirty rectangle since the parent" */
@@ -1002,9 +1019,11 @@ function set_history_image(node, image_data) {
 		node.patch = null;
 	}
 	history_anchor = { node, image: image_data };
+	recount_history_node(node);
 	for (const [child, child_image] of children) {
 		if (child_image) {
 			child.patch = make_history_patch(image_data, child_image);
+			recount_history_node(child);
 		}
 	}
 	history_dirty_reset();
@@ -1033,6 +1052,7 @@ function update_history_image_incrementally(node) {
 		paste_image_data(history_anchor.image, main_ctx.getImageData(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0), r.x0, r.y0);
 		const after = crop_image_data(history_anchor.image, u.x0, u.y0, w, h);
 		node.patch = node.parent ? make_history_patch_at(before, after, u.x0, u.y0) : null;
+		recount_history_node(node);
 	}
 	history_dirty_reset();
 	debug_check_anchor();
@@ -1121,6 +1141,7 @@ function make_history_node({
 		history_dirty_reset();
 	}
 	history_nodes_by_id.set(id, node);
+	recount_history_node(node);
 	return node;
 }
 
@@ -2561,6 +2582,7 @@ function make_or_update_undoable(undoable_meta, undoable_action) {
 		}
 		debug_history_snapshot(current_history_node);
 		current_history_node.selection_image_data = selection && selection.canvas.ctx.getImageData(0, 0, selection.canvas.width, selection.canvas.height);
+		recount_history_node(current_history_node);
 		current_history_node.selection_x = selection && selection.x;
 		current_history_node.selection_y = selection && selection.y;
 		if (undoable_meta.update_name) {
@@ -4708,6 +4730,7 @@ window.P95.prune_history = (keep) => {
 		const new_root = chain[chain.length - keep - 1];
 		new_root.parent = null;
 		new_root.patch = null; // (was relative to the removed parent)
+		recount_history_node(new_root);
 		root_history_node = new_root;
 	}
 	const kept = new Set();
@@ -4719,6 +4742,7 @@ window.P95.prune_history = (keep) => {
 	}
 	for (const [id, node] of history_nodes_by_id) {
 		if (!kept.has(node)) {
+			uncount_history_node(node);
 			history_nodes_by_id.delete(id);
 		}
 	}
@@ -4768,11 +4792,7 @@ const HISTORY_MIN_STEPS = 10;
  * and everything after them) that fit in half of it.
  */
 function trim_history_by_memory() {
-	let total = 0;
-	for (const node of history_nodes_by_id.values()) {
-		total += history_node_bytes(node);
-	}
-	if (total <= HISTORY_BUDGET_BYTES) {
+	if (history_bytes_total <= HISTORY_BUDGET_BYTES) {
 		return;
 	}
 	// First drop branches abandoned by undoing and then doing something else (kept for Edit > History),
@@ -4791,11 +4811,11 @@ function trim_history_by_memory() {
 	}
 	while (dropped.length) {
 		const node = dropped.pop();
+		uncount_history_node(node);
 		history_nodes_by_id.delete(node.id);
-		total -= history_node_bytes(node);
 		dropped.push(...node.futures);
 	}
-	if (total <= HISTORY_BUDGET_BYTES) {
+	if (history_bytes_total <= HISTORY_BUDGET_BYTES) {
 		$G.triggerHandler("history-update");
 		return;
 	}
@@ -4816,7 +4836,7 @@ window.P95.history_stats = () => {
 	for (const node of history_nodes_by_id.values()) {
 		bytes += history_node_bytes(node);
 	}
-	return { steps: history_nodes_by_id.size, bytes };
+	return { steps: history_nodes_by_id.size, bytes, running_total: history_bytes_total };
 };
 /** For the history restore's memory budget */
 window.P95.history_size = () => history_nodes_by_id.size;
@@ -4825,6 +4845,7 @@ window.P95.reset_history_keeping_canvas = () => {
 	redos.length = 0;
 	history_node_counter = 0;
 	history_nodes_by_id.clear();
+	history_bytes_total = 0;
 	history_anchor = null;
 	current_history_node = root_history_node = make_history_node({
 		name: localize("New"),

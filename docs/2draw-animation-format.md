@@ -145,6 +145,16 @@ FNV-1a (32-bit) over the canvas width, the height, then the RGBA bytes read as 3
 input in the text box, and gets UI commands from `P95.cmd()` wrappers around the engine's command functions. Tool state is
 diffed whenever options change and before each event.
 
+ENGINE_BEHAVIOR changes so far:
+
+- 1: software polygon rasterizer, seeded airbrush, text and transform results stored as pixels
+- 2: rotate and stretch/skew are software nearest-neighbor (no stored pixels)
+- 3: the history is capped by step count (pruned to `P95.history_keep_for(w, h)` steps, about 128 MB of full
+  snapshots, once it holds twice that)
+- 4: history steps are patches (the changed rectangle before/after); the history is trimmed by the memory its steps
+  hold (over 96 MB: first branches abandoned by undoing then doing something else, then the oldest steps, keeping
+  half the budget and at least 10 steps)
+
 Determinism measures in the engine (ENGINE_BEHAVIOR 1):
 
 - polygons, ellipses, rounded rectangles, curves and brush shapes are rasterized in software (`software_fill_polygon`,
@@ -172,7 +182,7 @@ file starts fresh with the `load` image as an `image` start.
 
 When revising, the editor always resumes from the previous recording: it replays the file's segments itself
 (`src/paint95-restore.js`, time-sliced, with a "Restoring history" progress box that can't be skipped), so undo can step
-back into earlier sessions, then prunes the history to the last `keep` steps (about 128 MB of snapshots, 10–100 steps; since ENGINE_BEHAVIOR 3 the engine also prunes to that whenever the history holds twice as many steps, while editing and replaying).
+back into earlier sessions, then prunes the history to the last `keep` steps (behavior 3: about 128 MB of snapshots, 10–100 steps; behavior 4, where steps are patches and the engine trims the history by the memory its steps hold: 10,000).
 The new segment is `continue` with `history: true`; replay does the same prune at that point instead of resetting the
 history.
 
