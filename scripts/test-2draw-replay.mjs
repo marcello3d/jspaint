@@ -236,6 +236,7 @@ async function replay_session(page, recording, { seek_back = false } = {}) {
 			onDrift: (drift) => drifts.push(drift),
 			onEnd: () => { ended = true; },
 		});
+		window.__p95_test_player = player;
 		await player.ready;
 		const wait_caught_up = async () => {
 			for (let i = 0; i < 2000; i++) {
@@ -481,7 +482,10 @@ if (process.argv.includes("--slow")) {
 		};
 	}
 }
-const only = process.argv.find((arg) => arg.startsWith("--only="))?.slice("--only=".length);
+const only_list = process.argv.find((arg) => arg.startsWith("--only="))?.slice("--only=".length).split(",");
+/** --only=a,b: run only the sessions/tests whose names contain one of these */
+const wanted = (name) => !only_list || only_list.some((part) => name.includes(part));
+const only = only_list ? only_list.join(",") : null;
 
 /**
  * The 2draw contract end to end: the editor in a host page submits (png, { animation }) with the Submit button;
@@ -859,11 +863,54 @@ async function test_format_v1_v2(recordings) {
 	}
 }
 
+/**
+ * The Local Font Access API (queryLocalFonts) shows a permission prompt: it must never be called on its own,
+ * neither by the player (text in a recording) nor by the editor's text tool.
+ */
+async function test_no_font_permission(recording_with_text) {
+	const spy = () => {
+		window.__query_local_fonts_calls = 0;
+		window.queryLocalFonts = async () => {
+			window.__query_local_fonts_calls++;
+			return [];
+		};
+	};
+	// editor: use the text tool
+	const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(editor, "fonts/editor");
+	await editor.addInitScript(spy);
+	await record_session(editor, {
+		width: 320, height: 240, script: async (t) => {
+			await t.tool("Text");
+			await t.drag([[20, 20], [200, 60]]);
+			await t.page.keyboard.type("fonts");
+			await t.page.waitForTimeout(500);
+			await t.tool("Pencil");
+		},
+	});
+	const editor_state = await editor.evaluate(() => ({
+		calls: window.__query_local_fonts_calls,
+		more_fonts: !!document.querySelector(".font-box select option[value='more-fonts']"),
+	}));
+	await editor.close();
+	check(editor_state.calls === 0, `fonts: the editor's text tool doesn't call queryLocalFonts (${editor_state.calls} calls)`);
+	check(editor_state.more_fonts, "fonts: the font list offers \"More fonts…\" instead");
+	if (!recording_with_text) return;
+	// player: a recording with text
+	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "fonts/player");
+	await page.addInitScript(spy);
+	const replay = await replay_session(page, recording_with_text, { keep_page: true });
+	const calls = await page.evaluate(() => window.__p95_test_player._frame.iframe.contentWindow.__query_local_fonts_calls);
+	await page.close();
+	check(replay.ended && calls === 0, `fonts: playing a recording with text doesn't call queryLocalFonts (${calls} calls)`);
+}
+
 const recordings = {};
 
 try {
 	for (const [name, script] of Object.entries(sessions)) {
-		if (only && !name.includes(only)) continue;
+		if (!wanted(name)) continue;
 		const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
 		watch(editor, `${name}/editor`);
 		const recording = await record_session(editor, { width: 320, height: 240, script });
@@ -883,16 +930,19 @@ try {
 			fs.writeFileSync(path.join(process.env.P95_SAVE, `${name}.p95`), Buffer.from(recording.base64, "base64"));
 		}
 	}
-	if (!only || "continue".includes(only)) {
+	if (wanted("continue")) {
 		await test_host_submit_and_continue();
 	}
-	if (!only || "midstroke".includes(only)) {
+	if (wanted("midstroke")) {
 		await test_mid_stroke_ink();
 	}
-	if (!only || "timing".includes(only)) {
+	if (wanted("timing")) {
 		await test_playback_timing();
 	}
-	if (!only || "format".includes(only)) {
+	if (wanted("fonts")) {
+		await test_no_font_permission(recordings.all_tools);
+	}
+	if (wanted("format")) {
 		await test_format_v1_v2(recordings);
 	}
 } finally {
