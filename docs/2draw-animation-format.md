@@ -144,7 +144,9 @@ localStorage. `player.js` creates it as a hidden same-origin iframe and drives `
 - each event is executed by calling the engine: pointer events are dispatched through the engine's own (jQuery) handlers on
   the recorded target, at the client position of the recorded canvas pixel's center; `s` events set the state;
   `f` events call the command implementations; `k` ticks run the airbrush; hooks consume `b` data;
-- playback time is recorded time with idle gaps capped at 1 s, times the speed; seeking backwards replays from the start
-  in a fresh iframe;
+- playback time (display only; the engine always sees the recorded times): while a pointer is down, recorded timing
+  (a pointer held still counts at most 1 s); pauses before a stroke or a picture-changing command count at most 250 ms;
+  events that don't change the picture (`s`, `h`, `p`, `b`, `select_tool`) take no time. Times the speed. Constants at the
+  top of `src/paint95-replay.js`. Seeking backwards replays from the start in a fresh iframe;
 - on a hash mismatch the player reports `onDrift` and snaps to the next PNG keyframe or, at the end of a segment, the final
   picture, and keeps going.

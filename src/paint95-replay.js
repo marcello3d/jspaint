@@ -7,8 +7,30 @@ import { cancel, deselect, get_tool_by_id, render_canvas_view, reset_canvas_and_
 import { $G, make_canvas } from "./helpers.js";
 import { decode_p95, decode_png, hash_image_data } from "./paint95-format.js";
 
-/** Longest idle time between events in playback (ms) */
-const IDLE_CAP = 1000;
+// Playback timing (display only; the replayed engine always sees the recorded times).
+/** While a pointer is down, recorded timing is kept, except a pointer held still longer than this (ms) */
+const STROKE_IDLE_CAP_MS = 1000;
+/** Longest pause between strokes / picture-changing commands (ms) */
+const BETWEEN_STROKES_CAP_MS = 250;
+/** Commands that don't change the picture take no playback time */
+const UI_ONLY_COMMANDS = new Set(["select_tool"]);
+
+/**
+ * Playback time taken by the gap before an event.
+ * @param {any[]} event
+ * @param {number} gap - recorded ms since the previous event
+ * @param {boolean} pointer_down - whether a pointer was down before this event
+ */
+function playback_gap(event, gap, pointer_down) {
+	if (pointer_down) {
+		return Math.min(gap, STROKE_IDLE_CAP_MS);
+	}
+	const type = event[0];
+	if (type === "s" || type === "h" || type === "p" || type === "b" || (type === "f" && UI_ONLY_COMMANDS.has(event[2]))) {
+		return 0;
+	}
+	return Math.min(gap, BETWEEN_STROKES_CAP_MS);
+}
 const POINTER_TYPE_NAMES = ["mouse", "pen", "touch"];
 
 export class ReplayController {
@@ -51,12 +73,15 @@ export class ReplayController {
 		let t = 0;
 		header.segments.forEach((segment, seg) => {
 			timeline.push({ t, seg, index: -1 });
-			let raw = 0;
-			let last_raw = 0;
+			const pointers_down = new Set();
 			segment.events.forEach((event, index) => {
-				raw += event[1];
-				t += Math.max(0, Math.min(raw - last_raw, IDLE_CAP));
-				last_raw = raw;
+				// (the recorded time before a zero-time event is skipped, not carried over to the next event)
+				t += playback_gap(event, Math.max(0, event[1]), pointers_down.size > 0);
+				if (event[0] === "d") {
+					pointers_down.add(event[2]);
+				} else if (event[0] === "u" || event[0] === "c") {
+					pointers_down.delete(event[2]);
+				}
 				timeline.push({ t, seg, index });
 			});
 			timeline.push({ t, seg, index: -2 });

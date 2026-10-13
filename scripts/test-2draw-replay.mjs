@@ -613,6 +613,90 @@ async function measure_restore(name, recording, width, height) {
 	check(state.start.history === true && !/p95nohistory/.test(state.url), `${name}: revising restores the undo history (${state.undos} undo steps; ${log.join("; ")})`);
 }
 
+/** .p95 container helpers (see docs/2draw-animation-format.md) */
+function p95_decode(buffer) {
+	const json_length = buffer.readUInt32LE(8);
+	const header = JSON.parse(zlib.inflateSync(buffer.subarray(12, 12 + json_length)).toString());
+	let offset = 12 + json_length;
+	const count = buffer.readUInt32LE(offset);
+	offset += 4;
+	const blobs = [];
+	for (let i = 0; i < count; i++) {
+		const length = buffer.readUInt32LE(offset);
+		blobs.push(buffer.subarray(offset + 4, offset + 4 + length));
+		offset += 4 + length;
+	}
+	return { header, blobs };
+}
+function p95_encode({ header, blobs }) {
+	const json = zlib.deflateSync(Buffer.from(JSON.stringify(header)));
+	const parts = [Buffer.from("P95A"), Buffer.from([1, 0, 0, 0])];
+	const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+	parts.push(u32(json.length), json, u32(blobs.length));
+	for (const blob of blobs) parts.push(u32(blob.length), blob);
+	return Buffer.concat(parts);
+}
+
+/**
+ * Playback timing: long pauses between strokes are skipped (a 10 s gap plays in at most 250 ms),
+ * strokes keep their recorded timing, and the replayed picture doesn't depend on any of it.
+ */
+async function test_playback_timing() {
+	const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(editor, "timing/editor");
+	const recording = await record_session(editor, {
+		width: 320, height: 240, script: async (t) => {
+			await t.tool("Pencil");
+			for (const y of [60, 140]) {
+				const [x0, y0] = await t.at(30, y);
+				await t.page.mouse.move(x0, y0);
+				await t.page.mouse.down();
+				for (let i = 1; i <= 30; i++) {
+					const [x, yy] = await t.at(30 + i * 8, y + Math.sin(i / 4) * 20);
+					await t.page.mouse.move(x, yy);
+					await t.page.waitForTimeout(15);
+				}
+				await t.page.mouse.up();
+				await t.page.waitForTimeout(100);
+			}
+		},
+	});
+	await editor.close();
+	// insert an artificial 10 s pause before the second stroke
+	const file = p95_decode(Buffer.from(recording.base64, "base64"));
+	const events = file.header.segments[0].events;
+	const downs = events.map((event, i) => (event[0] === "d" ? i : -1)).filter((i) => i >= 0);
+	const ups = events.map((event, i) => (event[0] === "u" ? i : -1)).filter((i) => i >= 0);
+	events[downs[1]][1] += 10000;
+	const first_stroke_recorded = events.slice(downs[0] + 1, ups[0] + 1).reduce((sum, event) => sum + event[1], 0);
+	const modified = { ...recording, base64: p95_encode(file).toString("base64") };
+
+	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "timing/player");
+	await page.route(`${base}/__test_host.html`, (route) => route.fulfill({
+		contentType: "text/html",
+		body: `<!doctype html><meta charset="utf-8"><body style="margin:0"><div id="root" style="width:320px;height:240px"></div><script src="player.js"></script>`,
+	}));
+	await page.goto(`${base}/__test_host.html`, { waitUntil: "load" });
+	const timing = await page.evaluate(async ({ base64, downs, ups }) => {
+		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+		const player = new window.Paint95Player({ domRoot: document.getElementById("root"), lsaUrl: URL.createObjectURL(new Blob([bytes])) });
+		await player.ready;
+		const at = (index) => player._controller.timeline.find((entry) => entry.index === index).t;
+		return { gap: at(downs[1]) - at(ups[0]), first_stroke: at(ups[0]) - at(downs[0]), duration: player.duration };
+	}, { base64: modified.base64, downs, ups });
+	await page.close();
+	check(timing.gap <= 250, `timing: a 10 s pause between strokes plays in ${timing.gap} ms (<= 250)`);
+	check(timing.first_stroke === first_stroke_recorded, `timing: a slow stroke keeps its recorded duration (${timing.first_stroke} ms, recorded ${first_stroke_recorded} ms)`);
+	check(timing.duration < 2 * first_stroke_recorded + 1000, `timing: total playback ${timing.duration} ms`);
+
+	const player_page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(player_page, "timing/replay");
+	const replay = await replay_session(player_page, modified);
+	await player_page.close();
+	compare("timing", recording, replay);
+}
+
 /**
  * Regression: the player must show strokes progressively (in-progress strokes live on mask/preview canvases until the
  * pointer is released). Seeks to the middle of long pencil, brush and rectangle drags and checks for ink in the
@@ -726,6 +810,9 @@ try {
 	}
 	if (!only || "midstroke".includes(only)) {
 		await test_mid_stroke_ink();
+	}
+	if (!only || "timing".includes(only)) {
+		await test_playback_timing();
 	}
 } finally {
 	await browser.close();
