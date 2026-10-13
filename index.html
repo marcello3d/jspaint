@@ -71,20 +71,15 @@
 
 	<!-- Note: no CDNs, even with fallback, as the fallback is too complicated to handle with CSP. -->
 	<script src="lib/jquery-3.4.1.min.js"></script>
-	<script src="lib/gif.js/gif.js"></script>
+	<!-- 2draw: gif.js, UTIF.js, bmp.js and AnyPalette are loaded on first use (helpers.js load_script) -->
 	<!-- pako is used by UPNG.js and UTIF.js -->
 	<script src="lib/pako-2.0.3.min.js"></script>
 	<script src="lib/UPNG.js"></script>
-	<script src="lib/UTIF.js"></script>
-	<script src="lib/bmp.js"></script>
-	<script src="lib/anypalette-0.6.0.js"></script>
 	<script src="lib/font-detective.js"></script>
 	<script src="lib/FileSaver.js"></script>
-	<script src="lib/libtess.min.js"></script>
 	<script src="lib/os-gui/parse-theme.js"></script>
 	<script src="lib/os-gui/$Window.js"></script>
 	<script src="lib/os-gui/MenuBar.js"></script>
-	<script src="lib/imagetracer_v1.2.5.js"></script>
 
 	<!-- must not be async/deferred, as it uses document.write(); and must come before other app code which uses localization functions -->
 	<!-- (also depends on msgbox.js and thus os-gui.js, but not initially) -->

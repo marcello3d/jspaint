@@ -10,7 +10,7 @@ import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
 // import { localize } from "./app-localization.js";
 import { default_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
-import { $G, E, TAU, debounce, from_canvas_coords, get_help_folder_icon, get_icon_for_tool, get_rgba_from_color, is_discord_embed, is_pride_month, make_canvas, render_access_key, to_canvas_coords } from "./helpers.js";
+import { $G, E, TAU, debounce, load_script, from_canvas_coords, get_help_folder_icon, get_icon_for_tool, get_rgba_from_color, is_discord_embed, is_pride_month, make_canvas, render_access_key, to_canvas_coords } from "./helpers.js";
 import { apply_image_transformation, draw_grid, draw_selection_box, flip_horizontal, flip_vertical, invert_monochrome, invert_rgb, rotate, stretch_and_skew, threshold_black_and_white } from "./image-manipulation.js";
 import { showMessageBox } from "./msgbox.js";
 import { localStore } from "./storage.js";
@@ -1400,7 +1400,7 @@ function open_from_file(file, source_file_handle) {
 	// Try loading as an image file first, then as a palette file, but show a combined error message if both fail.
 	read_image_file(file, (as_image_error, image_info) => {
 		if (as_image_error) {
-			AnyPalette.loadPalette(file, (as_palette_error, new_palette) => {
+			load_script("lib/anypalette-0.6.0.js").then(() => AnyPalette.loadPalette(file, (as_palette_error, new_palette) => {
 				if (as_palette_error) {
 					show_file_format_errors({ as_image_error, as_palette_error });
 					return;
@@ -1408,7 +1408,7 @@ function open_from_file(file, source_file_handle) {
 				palette = new_palette.map((color) => color.toString());
 				$colorbox.rebuild_palette();
 				window.console?.log(`Loaded palette: ${palette.map(() => "%c█").join("")}`, ...palette.map((color) => `color: ${color};`));
-			});
+			}), (error) => show_file_format_errors({ as_image_error, as_palette_error: error }));
 			return;
 		}
 		image_info.source_file_handle = source_file_handle;
@@ -2229,7 +2229,8 @@ function paste_impl(img_or_canvas, x, y) {
 	}
 }
 
-function render_history_as_gif() {
+async function render_history_as_gif() {
+	await load_script("lib/gif.js/gif.js"); // 2draw: loaded on first use
 	const $win = $DialogWindow();
 	$win.title("Rendering GIF");
 
@@ -4261,6 +4262,11 @@ function save_as_prompt({
 function write_image_file(canvas, mime_type, blob_callback) {
 	const ctx = canvas.getContext("2d");
 	const bmp_match = mime_type.match(/^image\/(?:x-)?bmp\s*(?:-(\d+)bpp)?/);
+	// 2draw: encoders for rarer formats are loaded on first use
+	if ((bmp_match && !window.encodeBMP) || (mime_type === "image/tiff" && !window.UTIF)) {
+		load_script(bmp_match ? "lib/bmp.js" : "lib/UTIF.js").then(() => write_image_file(canvas, mime_type, blob_callback), (error) => show_error_message(localize("Failed to save document."), error));
+		return;
+	}
 	if (bmp_match) {
 		const file_content = encodeBMP(ctx.getImageData(0, 0, canvas.width, canvas.height), parseInt(bmp_match[1] || "24", 10));
 		const blob = new Blob([file_content]);
@@ -4309,7 +4315,7 @@ function read_image_file(blob, callback) {
 	let palette;
 	let monochrome = false;
 
-	blob.arrayBuffer().then((arrayBuffer) => {
+	blob.arrayBuffer().then(async (arrayBuffer) => {
 		// Helpers:
 		// "GIF".split("").map(c=>"0x"+c.charCodeAt(0).toString("16")).join(", ")
 		// [0x47, 0x49, 0x46].map(c=>String.fromCharCode(c)).join("")
@@ -4338,6 +4344,12 @@ function read_image_file(blob, callback) {
 				// 2draw: pdf.js is not shipped in the 2draw build
 				if (window["pdfjs-dist/build/pdf"]) detected_type_id = "pdf";
 			}
+		}
+		// 2draw: decoders for rarer formats are loaded on first use
+		if (detected_type_id === "bmp") {
+			await load_script("lib/bmp.js");
+		} else if (detected_type_id === "tiff_be" || detected_type_id === "tiff_le") {
+			await load_script("lib/UTIF.js");
 		}
 		if (detected_type_id === "bmp") {
 			const { colorTable, bitsPerPixel, imageData } = decodeBMP(arrayBuffer);

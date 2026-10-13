@@ -1,4 +1,5 @@
 // @ts-check
+import { load_script } from "./helpers.js";
 /* global get_direction, localize */
 
 // import { get_direction, localize } from "./app-localization.js";
@@ -111,8 +112,13 @@ const image_format_categories = (image_formats) => {
 };
 */
 
-/** @type {PaletteFileFormat[]} */
+/** @type {PaletteFileFormat[]} (2draw: filled by load_palette_formats(), which loads AnyPalette on first use) */
 const palette_formats = [];
+let palette_formats_loaded = null;
+function load_palette_formats() {
+	return (palette_formats_loaded ??= load_script("lib/anypalette-0.6.0.js").then(fill_palette_formats));
+}
+function fill_palette_formats() {
 for (const [format_id, format] of Object.entries(AnyPalette.formats)) {
 	if (format.write) {
 		const inside_parens = format.fileExtensions.map((extension) => `*.${extension}`).join(";");
@@ -130,7 +136,8 @@ palette_formats.sort((a, b) =>
 	+(b.formatID === "GIMP_PALETTE") - +(a.formatID === "GIMP_PALETTE") ||
 	0
 );
+}
 
-export { formats_unique_per_file_extension, image_formats, palette_formats };
+export { formats_unique_per_file_extension, image_formats, load_palette_formats, palette_formats };
 // Temporary globals until all dependent code is converted to ES Modules
 window.formats_unique_per_file_extension = formats_unique_per_file_extension; // used by electron-injected.js

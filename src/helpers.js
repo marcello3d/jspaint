@@ -204,6 +204,29 @@ function image_data_match(a, b, threshold) {
  * @overload
  * @returns {PixelCanvas}  a new canvas element, augmented with `ctx` property, which is also augmented
  */
+/**
+ * Loads a classic script once (2draw: libraries only some features need are loaded on first use).
+ * @param {string} src
+ * @returns {Promise<void>}
+ */
+function load_script(src) {
+	if (!loading_scripts.has(src)) {
+		loading_scripts.set(src, new Promise((resolve, reject) => {
+			const script = document.createElement("script");
+			script.src = src;
+			script.onload = () => resolve();
+			script.onerror = () => {
+				loading_scripts.delete(src);
+				reject(new Error(`Failed to load ${src}`));
+			};
+			document.head.appendChild(script);
+		}));
+	}
+	return loading_scripts.get(src);
+}
+/** @type {Map<string, Promise<void>>} */
+const loading_scripts = new Map();
+
 // #region Canvas content bounds (2draw)
 // Every canvas made by make_canvas keeps a conservative bounding box of where it may have non-transparent pixels
 // (`canvas.content_bounds`, or null when empty), updated by its drawing calls. So when one canvas is drawn onto
@@ -660,6 +683,7 @@ function supports_vertical_writing_mode() {
 
 
 export {
+	load_script,
 	$G,
 	E,
 	TAU,

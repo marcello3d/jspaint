@@ -1000,6 +1000,46 @@ async function test_no_font_permission(recording_with_text) {
 }
 
 /**
+ * Libraries for rarer formats (bmp.js, UTIF.js, AnyPalette, gif.js) load on first use: pasting a BMP works.
+ */
+async function test_lazy_libraries() {
+	// a 4x2 24-bit BMP
+	const width = 4;
+	const height = 2;
+	const row = Math.ceil(width * 3 / 4) * 4;
+	const bmp = Buffer.alloc(54 + row * height);
+	bmp.write("BM", 0);
+	bmp.writeUInt32LE(bmp.length, 2);
+	bmp.writeUInt32LE(54, 10);
+	bmp.writeUInt32LE(40, 14);
+	bmp.writeInt32LE(width, 18);
+	bmp.writeInt32LE(height, 22);
+	bmp.writeUInt16LE(1, 26);
+	bmp.writeUInt16LE(24, 28);
+	bmp.writeUInt32LE(row * height, 34);
+	for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+		const o = 54 + y * row + x * 3;
+		bmp[o] = 255; bmp[o + 1] = x * 60; bmp[o + 2] = y * 200; // BGR
+	}
+	const page = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(page, "lazy");
+	await page.goto(`${base}/index.html?w=100&h=80`);
+	await wait_until(page, () => !!(window.P95 && window.P95.recorder));
+	const before = await page.evaluate(() => [typeof window.decodeBMP, typeof window.AnyPalette, typeof window.GIF, typeof window.UTIF]);
+	await page.click(`.menus .menu-button:has-text("Edit")`);
+	const [chooser] = await Promise.all([
+		page.waitForEvent("filechooser"),
+		page.click(`.menu-popup:visible .menu-item[aria-label="Paste From..."]`),
+	]);
+	await chooser.setFiles({ name: "paste.bmp", mimeType: "image/bmp", buffer: bmp });
+	await wait_until(page, () => !!selection);
+	const after = await page.evaluate(() => ({ decoder: typeof window.decodeBMP, size: [selection.width, selection.height] }));
+	await page.close();
+	check(before.every((t) => t === "undefined"), `lazy: bmp.js, AnyPalette, gif.js and UTIF.js aren't loaded at startup (${before})`);
+	check(after.decoder === "function" && after.size.join() === "4,2", `lazy: pasting a BMP loads its decoder (${JSON.stringify(after)})`);
+}
+
+/**
  * History steps are stored as patches: going to every step of a varied session must give exactly the picture
  * that step had when it was made (hashes taken at the time, with &p95debug=1).
  */
@@ -1222,6 +1262,9 @@ try {
 	}
 	if (wanted("fonts")) {
 		await test_no_font_permission(recordings.all_tools);
+	}
+	if (wanted("lazy")) {
+		await test_lazy_libraries();
 	}
 	if (wanted("patches")) {
 		await test_history_patches();

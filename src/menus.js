@@ -4,7 +4,7 @@
 // import { available_languages, get_iso_language_name, get_language, get_language_emoji, get_language_endonym, localize, set_language } from "./app-localization.js";
 import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
 import { show_edit_colors_window } from "./edit-colors.js";
-import { palette_formats } from "./file-format-data.js";
+import { load_palette_formats, palette_formats } from "./file-format-data.js";
 import { change_url_param, choose_file_to_paste, clear, delete_selection, edit_copy, edit_cut, edit_paste, file_new, file_save, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, redo, render_history_as_gif, sanity_check_blob, save_selection_to_file, select_all, set_magnification, show_about_paint, show_custom_zoom_window, show_document_history, show_file_format_errors, toggle_grid, toggle_thumbnail, undo, view_bitmap } from "./functions.js";
 import { $G, get_rgba_from_color, is_discord_embed } from "./helpers.js";
 import { showMessageBox } from "./msgbox.js";
@@ -476,6 +476,7 @@ const menus = {
 			],
 			action: async () => {
 				const { file } = await systemHooks.showOpenFileDialog({ formats: palette_formats });
+				await load_palette_formats(); // (loads AnyPalette)
 				AnyPalette.loadPalette(file, (error, new_palette) => {
 					if (error) {
 						show_file_format_errors({ as_palette_error: error });
@@ -493,7 +494,8 @@ const menus = {
 			speech_recognition: [
 				"save colors", "save list of colors", "save color palette", "save palette", "save color palette file", "save palette file",
 			],
-			action: () => {
+			action: async () => {
+				await load_palette_formats(); // (loads AnyPalette)
 				const ap = new AnyPalette.Palette();
 				ap.name = "JSPaint.exe Saved Colors";
 				ap.numberOfColumns = 16; // 14?

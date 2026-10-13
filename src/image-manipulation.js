@@ -1695,7 +1695,8 @@ function createShaderProgram() {
 
 export function init_webgl_stuff() {
 
-	tessy = initTesselator();
+	// 2draw: no tesselator (libtess): polygons are rasterized in software
+	void initTesselator;
 
 	op_canvas_webgl = document.createElement("canvas");
 	op_canvas_2d = document.createElement("canvas");
