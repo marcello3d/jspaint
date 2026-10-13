@@ -4307,6 +4307,26 @@ window.P95.prune_history = (keep) => {
 	}
 	$G.triggerHandler("history-update");
 };
+/**
+ * After restoring a revision's history: one undoable step that sets the canvas to the posted picture
+ * (when the replay didn't end exactly on it). Replay does the same (start.snap).
+ * @param {ImageData} image_data
+ */
+window.P95.snap_to_picture = (image_data) => {
+	deselect(true);
+	undoable({
+		name: "Previous Version",
+		icon: get_help_folder_icon("p_open.png"),
+	}, () => {
+		my_canvas_width = image_data.width;
+		my_canvas_height = image_data.height;
+		main_canvas.width = image_data.width;
+		main_canvas.height = image_data.height;
+		main_ctx.disable_image_smoothing();
+		main_ctx.putImageData(image_data, 0, 0);
+		$canvas_area.trigger("resize");
+	});
+};
 /** For the history restore's memory budget */
 window.P95.history_size = () => history_nodes_by_id.size;
 window.P95.reset_history_keeping_canvas = () => {

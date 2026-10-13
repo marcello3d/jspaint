@@ -53,9 +53,10 @@ snapshots (v1 files may also have embedded starting pictures, rotate/stretch res
        | { type: "continue", hash, url? }, // continue from the previous segment's result, cropped/padded onto
                                   //   white width×height (as it was submitted); hash = expected start pixels;
                                   //   url = that picture (the previous version's PNG), used if the replay drifted
-       | { type: "continue", hash, history: true, keep }, // the editor restored the previous sessions' undo
-                                  //   history (see below) and continued from that exact state, after keeping only
-                                  //   the last `keep` undo steps (P95.prune_history)
+       | { type: "continue", hash, history: true, keep, snap?, url?, blob? }, // the editor restored the previous
+                                  //   sessions' undo history (see below) and continued from that exact state, after
+                                  //   keeping only the last `keep` undo steps (P95.prune_history); snap: then it set
+                                  //   the canvas to the posted picture (url + hash, or blob) as one more undoable step
   events: [Event, ...],
   duration,                       // ms of recording
   truncated?: true,               // events stop early (size cap); the end picture still exists
@@ -169,16 +170,20 @@ file starts fresh with the `load` image as an `image` start.
 
 ### Restoring the undo history
 
-When revising, the editor replays the previous file's segments itself (`src/paint95-restore.js`, time-sliced, with a
-"Restoring history" box and a Skip button), so undo can step back into earlier sessions. It then checks that the result
-matches the last segment's final hash and the loaded picture, and prunes the history to the last `keep` steps
-(about 256 MB of snapshots, 10–100 steps). The new segment is then `continue` with `history: true`; replay does the same
-prune at that point instead of resetting the history.
+When revising, the editor always resumes from the previous recording: it replays the file's segments itself
+(`src/paint95-restore.js`, time-sliced, with a "Restoring history" progress box that can't be skipped), so undo can step
+back into earlier sessions, then prunes the history to the last `keep` steps (about 256 MB of snapshots, 10–100 steps).
+The new segment is `continue` with `history: true`; replay does the same prune at that point instead of resetting the
+history.
 
-It isn't attempted (the editor continues from the flattened picture, as `continue` without `history`) when the file is
-truncated, from a newer engine, changed size, or doesn't end with the loaded picture. If it's attempted and then fails
-(drift, final mismatch, more than 10 s, more than ~600 MB of snapshots, an error, or Skip), the editor reloads itself
-with `&p95nohistory=1` and continues from the picture.
+If the replayed picture isn't exactly the posted one (the replay drifted, the log is truncated, a newer engine recorded it,
+or the size changed), the history is still kept and one more undoable step ("Previous Version", `P95.snap_to_picture`)
+sets the canvas to the posted picture. The segment records it as `snap: true`, with the picture by `url` (a 2draw
+picture, verified by `hash`) or embedded as `blob`, and replay performs the same step.
+
+Only a missing (404, network error) or unreadable (corrupt, unknown container) file starts over from the picture: a
+`continue` segment without `history`, or an `image` start if the file couldn't be loaded at all. (`&p95nohistory=1`, set
+by a reload if replaying throws, does the same.)
 
 ### Loading `load` and `anim`
 

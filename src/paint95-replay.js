@@ -243,15 +243,24 @@ export class ReplayController {
 		if (segment.start.type === "continue" && segment.start.history && seg > 0) {
 			// The editor restored the previous sessions' undo history (by replaying them) and continued from there.
 			// See paint95-restore.js; this must do exactly what the editor did after restoring.
-			const actual = hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height));
-			if (actual === segment.start.hash && main_canvas.width === segment.width && main_canvas.height === segment.height) {
-				my_canvas_width = segment.width;
-				my_canvas_height = segment.height;
-				window.P95.prune_history(segment.start.keep);
-				return;
+			my_canvas_width = segment.width;
+			my_canvas_height = segment.height;
+			window.P95.prune_history(segment.start.keep);
+			if (segment.start.snap) {
+				// the editor then set the canvas to the posted picture, as an undoable step
+				const picture = segment.start.blob != null ? this.blob_image_data(segment.start.blob) : this.start_images.get(seg);
+				if (picture) {
+					window.P95.snap_to_picture(picture);
+				} else {
+					this.drift({ type: "start", segment: seg, message: "posted picture unavailable" });
+				}
 			}
-			this.drift({ type: "start", segment: seg, expected: segment.start.hash, actual });
-			// fall back to continuing from the flattened picture (the history won't match, but keyframes will catch it)
+			const actual = hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height));
+			if (actual !== segment.start.hash) {
+				this.drift({ type: "start", segment: seg, expected: segment.start.hash, actual });
+			}
+			window.$canvas_area.trigger("resize");
+			return;
 		}
 
 		if (seg > 0 || segment.start.type === "continue") {

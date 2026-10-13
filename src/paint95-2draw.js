@@ -209,11 +209,8 @@ function init_editor() {
 	async function load_previous_animation(url) {
 		try {
 			const response = await fetch_cors(url);
-			const file = decode_p95(await response.arrayBuffer());
-			if (file.header.segments.some((segment) => (segment.engine?.behavior ?? 0) > window.P95.ENGINE_BEHAVIOR)) {
-				throw new Error("recorded with a newer version");
-			}
-			return file;
+			// (a file from a newer engine is still resumed: only a missing or undecodable file starts over from the picture)
+			return decode_p95(await response.arrayBuffer());
 		} catch (error) {
 			console.warn("Couldn't load the previous animation; starting a new one.", error);
 			return null;
@@ -254,17 +251,20 @@ function init_editor() {
 			loaded = await load_initial_image(window.paint95_load_url);
 		}
 		const previous = loaded ? await previous_promise : null;
-		// Revising: replay the previous sessions in the editor so their undo history is back.
+		// Revising: resume from the previous recording (replayed in the editor, so its undo history is back).
 		let history_keep = null;
+		let snapped = false;
 		if (previous && !window.paint95_no_history) {
-			const expected_hash = hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height));
-			const result = await restore_history(previous, { width: required_width, height: required_height, expected_hash });
-			if (result.ok) {
+			const expected_image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+			try {
+				const result = await restore_history(previous, { width: required_width, height: required_height, expected_image_data });
 				history_keep = result.keep;
+				snapped = result.snapped;
 				set_magnification(1);
 				zoom_out_to_fit();
-			} else if (result.modified) {
-				// Start over cleanly from the picture (the half-restored state can't be trusted).
+			} catch (error) {
+				// The recording couldn't be replayed at all (unreadable): start over from the picture.
+				console.error("Couldn't restore the undo history", error);
 				const params = new URLSearchParams(location.search);
 				params.set("p95nohistory", "1");
 				location.replace(`${location.pathname}?${params}${location.hash}`);
@@ -275,7 +275,7 @@ function init_editor() {
 			recorder = new Recorder({ previous });
 			// An immutable versioned 2draw picture (…/data/13/132726/132726-v1.png) is stored by reference.
 			const reference_url = loaded && is_reference_url(window.paint95_load_url) ? window.paint95_load_url : null;
-			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank", history_keep, url: reference_url });
+			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank", history_keep, url: reference_url, snapped });
 		} catch (error) {
 			console.error("Failed to start recording", error);
 			recorder = null;

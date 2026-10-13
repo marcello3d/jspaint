@@ -127,8 +127,9 @@ export class Recorder {
 	 *   (and pruned to this many steps), see paint95-restore.js
 	 * @param {string | null} [options.url] - the starting picture's URL, if it's an immutable 2draw picture: stored by
 	 *   reference (with its hash) instead of embedding it
+	 * @param {boolean} [options.snapped] - after restoring the history, the canvas was set to the posted picture
 	 */
-	begin({ start, history_keep = null, url = null }) {
+	begin({ start, history_keep = null, url = null, snapped = false }) {
 		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 		if (start === "image" && url) {
 			this.segment.start = { type: "image", url, hash: hash_image_data(image_data) };
@@ -141,6 +142,13 @@ export class Recorder {
 			}
 			if (history_keep != null) {
 				Object.assign(this.segment.start, { history: true, keep: history_keep });
+				if (snapped) {
+					// after restoring, the canvas was set to the posted picture (P95.snap_to_picture): by URL, else embedded
+					this.segment.start.snap = true;
+					if (!url) {
+						this.segment.start.blob = this.add_blob(image_data);
+					}
+				}
 			}
 		} else {
 			this.segment.start = { type: "blank" };

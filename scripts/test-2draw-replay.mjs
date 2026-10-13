@@ -601,6 +601,86 @@ async function test_host_submit_and_continue() {
 	const replay = await replay_session(player_page, { base64: p95.toString("base64") });
 	await player_page.close();
 	compare("continue", { width: 200, height: 150, pixels: editor_pixels }, replay);
+	return { png: files.png, p95_v2: Buffer.from(first.p95) };
+}
+
+/**
+ * Revising always resumes from the recording; only a missing (404) or unreadable file starts over from the picture.
+ * A drifting replay (wrong seed) or a truncated log still resumes with history and ends exactly on the posted picture.
+ */
+async function test_resume_cases(session1) {
+	const variants = {
+		corrupt: Buffer.concat([Buffer.from("P95A"), Buffer.from([2, 0, 0, 0, 0xff, 0xff, 0xff, 0x7f, 1, 2, 3])]),
+		...await with_format((format, b64, base64) => {
+			const seed = format.decode_p95(b64.decode(base64));
+			seed.header.segments[0].seed ^= 0x5a5a5a5a; // the airbrush sprays differently: the replay drifts
+			const truncated = format.decode_p95(b64.decode(base64));
+			const events = truncated.header.segments[0].events;
+			truncated.header.segments[0].events = events.slice(0, events.findIndex((e) => e[0] === "u") + 1);
+			truncated.header.segments[0].truncated = true;
+			truncated.header.truncated = true;
+			return { seed: b64.encode(format.encode_p95(seed)), truncated: b64.encode(format.encode_p95(truncated)) };
+		}, session1.p95_v2.toString("base64")),
+	};
+	for (const key of ["seed", "truncated"]) variants[key] = Buffer.from(variants[key], "base64");
+	for (const [name, p95] of Object.entries(variants)) {
+		const page = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+		watch(page, `resume/${name}`);
+		await page.route((url) => /\/__(resume\.html|prev\.png|var\.p95)$/.test(url.pathname), (route) => {
+			const file = new URL(route.request().url()).pathname.split("/").pop();
+			if (file === "__prev.png") return route.fulfill({ contentType: "image/png", body: session1.png });
+			if (file === "__var.p95") return route.fulfill({ contentType: "application/octet-stream", body: p95 });
+			return route.fulfill({ contentType: "text/html", body: `<!doctype html><body style="margin:0"><script>window.submissions=[];window.paint95Host={async submit(png,extra){const r=(b)=>b.arrayBuffer().then((x)=>Array.from(new Uint8Array(x)));window.submissions.push({png:await r(png),p95:extra&&extra.animation?await r(extra.animation):null});}};</script><iframe src="index.html?w=200&h=150&load=${encodeURIComponent(`${base}/__prev.png`)}&anim=${encodeURIComponent(`${base}/__var.p95`)}" style="border:0;width:1000px;height:680px"></iframe>` });
+		});
+		await page.goto(`${base}/__resume.html`);
+		const frame = await (await page.waitForSelector("iframe")).contentFrame();
+		for (let i = 0; i < 200; i++) {
+			if (await frame.evaluate(() => !!(window.P95 && window.P95.recorder)).catch(() => false)) break;
+			await page.waitForTimeout(100);
+		}
+		const state = await frame.evaluate((png_bytes) => ({
+			start: window.P95.recorder.segment.start,
+			url: location.search,
+			undos: undos.length,
+			pixels_hash: (() => { const d = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height).data; let h = 0; for (let i = 0; i < d.length; i++) h = (Math.imul(h, 31) + d[i]) | 0; return h; })(),
+		}));
+		const posted = await frame.evaluate(async () => {
+			// hash of the posted picture, decoded the way the editor loads it
+			const { load_picture_image_data } = await import("./src/paint95-fetch.js");
+			const d = (await load_picture_image_data(window.paint95_load_url, 200, 150)).data;
+			let h = 0;
+			for (let i = 0; i < d.length; i++) h = (Math.imul(h, 31) + d[i]) | 0;
+			return h;
+		});
+		if (name === "corrupt") {
+			check(state.start.type === "image" && !state.start.history, `resume: an unreadable recording starts over from the picture (${JSON.stringify(state.start).slice(0, 80)})`);
+			await page.close();
+			continue;
+		}
+		check(state.start.type === "continue" && state.start.history && state.start.snap === true && !/p95nohistory/.test(state.url),
+			`resume: ${name}: resumes with history, then sets the posted picture (${JSON.stringify({ ...state.start, hash: undefined })}; ${state.undos} undo steps)`);
+		check(state.pixels_hash === posted, `resume: ${name}: the canvas is exactly the posted picture`);
+		// draw, undo once (keeps the snap step), draw, submit; the combined file replays to the same picture
+		const box = await (await frame.$(".main-canvas")).boundingBox();
+		const scale = box.width / 200;
+		await frame.click(`.tools-component .tool[title="Line"]`);
+		await page.mouse.move(box.x + 10 * scale, box.y + 140 * scale);
+		await page.mouse.down();
+		await page.mouse.move(box.x + 190 * scale, box.y + 100 * scale, { steps: 4 });
+		await page.mouse.up();
+		await frame.click(".paint95-submit-button");
+		await page.waitForFunction(() => window.submissions.length > 0);
+		const submitted = await page.evaluate(() => window.submissions[0]);
+		const editor_pixels = await frame.evaluate(() => Array.from(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height).data));
+		await page.close();
+		const player_page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+		watch(player_page, `resume/${name}/player`);
+		const replay = await replay_session(player_page, { base64: Buffer.from(submitted.p95).toString("base64") });
+		await player_page.close();
+		check(replay.ended, `resume: ${name}: the combined recording plays to the end (drift reports: ${replay.drifts.map((d) => d.type).join(",") || "none"})`);
+		const same = replay.pixels.length === editor_pixels.length && replay.pixels.every((v, i) => v === editor_pixels[i]);
+		check(same, `resume: ${name}: the combined recording replays to exactly the submitted picture`);
+	}
 }
 
 /**
@@ -996,8 +1076,9 @@ try {
 			fs.writeFileSync(path.join(process.env.P95_SAVE, `${name}.p95`), Buffer.from(recording.base64, "base64"));
 		}
 	}
-	if (wanted("continue")) {
-		await test_host_submit_and_continue();
+	if (wanted("continue") || wanted("resume")) {
+		const session1 = await test_host_submit_and_continue();
+		await test_resume_cases(session1);
 	}
 	if (wanted("midstroke")) {
 		await test_mid_stroke_ink();
