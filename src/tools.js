@@ -139,18 +139,36 @@ const TOOL_ROUNDED_RECTANGLE = "TOOL_ROUNDED_RECTANGLE";
 // the picture every time: the player renders in-progress strokes every frame. Same pixels as make_canvas(mask).
 /** @type {PixelCanvas | null} */
 let mask_fill_scratch = null;
-/** @param {PixelCanvas} source */
-function mask_fill_canvas_from(source) {
-	if (!mask_fill_scratch || mask_fill_scratch.width !== source.width || mask_fill_scratch.height !== source.height) {
-		mask_fill_scratch = make_canvas(source.width, source.height);
+/**
+ * The rectangle of a tool's mask to render: where it has content, or all of it.
+ * @param {PixelCanvas} mask
+ * @param {boolean} whole
+ * @returns {{ x0: number, y0: number, x1: number, y1: number } | null} null: nothing to render
+ */
+function mask_render_rect(mask, whole) {
+	if (whole || mask.content_bounds === undefined) {
+		return { x0: 0, y0: 0, x1: mask.width, y1: mask.height };
+	}
+	return mask.content_bounds;
+}
+/**
+ * A copy of part of a mask on the scratch canvas (positioned at r.x0, r.y0 when drawn back).
+ * @param {PixelCanvas} source
+ * @param {{ x0: number, y0: number, x1: number, y1: number }} r
+ */
+function mask_fill_canvas_from(source, r) {
+	const width = r.x1 - r.x0;
+	const height = r.y1 - r.y0;
+	if (!mask_fill_scratch || mask_fill_scratch.width !== width || mask_fill_scratch.height !== height) {
+		mask_fill_scratch = make_canvas(width, height);
 	} else {
 		const ctx = mask_fill_scratch.ctx;
 		ctx.setTransform(1, 0, 0, 1, 0, 0);
 		ctx.globalCompositeOperation = "source-over";
 		ctx.globalAlpha = 1;
-		ctx.clearRect(0, 0, source.width, source.height);
+		ctx.clearRect(0, 0, width, height);
 	}
-	mask_fill_scratch.ctx.drawImage(source, 0, 0);
+	mask_fill_scratch.ctx.drawImage(source, r.x0, r.y0, width, height, 0, 0, width, height);
 	return mask_fill_scratch;
 }
 
@@ -1440,9 +1458,13 @@ tools.forEach((tool) => {
 			}
 		};
 		tool.render_from_mask = (ctx, previewing) => { // could be private
+			// 2draw: only the part of the mask that has content (same pixels; much less work on big canvases)
+			const r = mask_render_rect(tool.mask_canvas, previewing && tool.dynamic_preview_cursor);
 			ctx.save();
 			ctx.globalCompositeOperation = "destination-out";
-			ctx.drawImage(tool.mask_canvas, 0, 0);
+			if (r) {
+				ctx.drawImage(tool.mask_canvas, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+			}
 			ctx.restore();
 
 			/** @type {string | CanvasGradient | CanvasPattern} */
@@ -1473,9 +1495,11 @@ tools.forEach((tool) => {
 				color = gradient;
 			}
 			// @TODO: perf: keep this canvas around too
-			const mask_fill_canvas = mask_fill_canvas_from(tool.mask_canvas);
-			replace_colors_with_swatch(mask_fill_canvas.ctx, color, 0, 0);
-			ctx.drawImage(mask_fill_canvas, 0, 0);
+			if (r) {
+				const mask_fill_canvas = mask_fill_canvas_from(tool.mask_canvas, r);
+				replace_colors_with_swatch(mask_fill_canvas.ctx, color, r.x0, r.y0);
+				ctx.drawImage(mask_fill_canvas, r.x0, r.y0);
+			}
 			return translucent;
 		};
 		tool.drawPreviewUnderGrid = (ctx, _x, _y, _grid_visible, scale, translate_x, translate_y) => {
@@ -1548,9 +1572,13 @@ tools.forEach((tool) => {
 			}
 		};
 		tool.render_from_mask = (ctx, previewing) => { // could be private
+			// 2draw: only the part of the mask that has content (same pixels; much less work on big canvases)
+			const r = mask_render_rect(tool.mask_canvas, previewing && tool.dynamic_preview_cursor);
 			ctx.save();
 			ctx.globalCompositeOperation = "destination-out";
-			ctx.drawImage(tool.mask_canvas, 0, 0);
+			if (r) {
+				ctx.drawImage(tool.mask_canvas, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+			}
 			ctx.restore();
 
 			/** @type {string | CanvasGradient | CanvasPattern} */
@@ -1581,15 +1609,19 @@ tools.forEach((tool) => {
 				color = gradient;
 			}
 			// @TODO: perf: keep this canvas around too
-			const mask_fill_canvas = mask_fill_canvas_from(tool.mask_canvas);
+			if (!r) {
+				return translucent;
+			}
+			const mask_fill_canvas = mask_fill_canvas_from(tool.mask_canvas, r);
 			if (previewing && tool.dynamic_preview_cursor) {
 				const brush = tool.get_brush();
 				// dynamic cursor preview:
 				// stamp just onto this temporary canvas so it's temporary
+				// (the whole mask is used in this case: r is the whole canvas)
 				stamp_brush_canvas(mask_fill_canvas.ctx, pointer.x, pointer.y, brush.shape, brush.size);
 			}
-			replace_colors_with_swatch(mask_fill_canvas.ctx, color, 0, 0);
-			ctx.drawImage(mask_fill_canvas, 0, 0);
+			replace_colors_with_swatch(mask_fill_canvas.ctx, color, r.x0, r.y0);
+			ctx.drawImage(mask_fill_canvas, r.x0, r.y0);
 			return translucent;
 		};
 		tool.drawPreviewUnderGrid = (ctx, _x, _y, _grid_visible, scale, translate_x, translate_y) => {

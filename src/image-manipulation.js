@@ -417,6 +417,11 @@ function draw_fill_without_pattern_support(ctx, start_x, start_y, fill_r, fill_g
 		return;
 	}
 
+	// 2draw: bounds of the filled pixels, so only that rectangle is written back (and recorded in the history)
+	let fill_x0 = Infinity;
+	let fill_y0 = Infinity;
+	let fill_x1 = -1;
+	let fill_y1 = -1;
 	while (stack.length) {
 		let new_pos;
 		let x;
@@ -444,6 +449,10 @@ function draw_fill_without_pattern_support(ctx, start_x, start_y, fill_r, fill_g
 			}
 
 			do_fill_at(pixel_pos);
+			if (x < fill_x0) fill_x0 = x;
+			if (x > fill_x1) fill_x1 = x;
+			if (y < fill_y0) fill_y0 = y;
+			if (y > fill_y1) fill_y1 = y;
 
 			if (x > 0) {
 				if (should_fill_at(pixel_pos - 4)) {
@@ -470,7 +479,9 @@ function draw_fill_without_pattern_support(ctx, start_x, start_y, fill_r, fill_g
 			pixel_pos += c_width * 4;
 		}
 	}
-	ctx.putImageData(id, 0, 0);
+	if (fill_x1 >= 0) {
+		ctx.putImageData(id, 0, 0, fill_x0, fill_y0, fill_x1 - fill_x0 + 1, fill_y1 - fill_y0 + 1);
+	}
 
 	function should_fill_at(pixel_pos) {
 		return (
