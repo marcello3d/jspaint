@@ -12,6 +12,9 @@ import { E } from "./helpers.js";
 import { hash_image_data } from "./paint95-format.js";
 import { ReplayController } from "./paint95-replay.js";
 
+/** Work per frame while restoring: long enough to keep frame overhead small, short enough for a live progress bar */
+const RESTORE_SLICE_MS = 40;
+
 /**
  * Undo steps kept after restoring (the engine's own history limit; see P95.history_keep_for)
  * @param {number} width
@@ -54,7 +57,7 @@ export async function restore_history(file, { width, height, expected_image_data
 		await controller.prepare(); // starting pictures stored by URL
 		while (!controller.done) {
 			await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-			controller.advance_to(Infinity, 12);
+			controller.advance_to(Infinity, RESTORE_SLICE_MS);
 			$progress.attr("value", Math.round(100 * controller.position / controller.timeline.length));
 		}
 	} finally {

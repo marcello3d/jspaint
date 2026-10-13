@@ -135,6 +135,25 @@ const TOOL_ELLIPSE = "TOOL_ELLIPSE";
 const TOOL_ROUNDED_RECTANGLE = "TOOL_ROUNDED_RECTANGLE";
 
 /** @type {Tool[]} */
+// 2draw: a reused scratch canvas for coloring a tool's mask (render_from_mask), instead of allocating a canvas the size of
+// the picture every time: the player renders in-progress strokes every frame. Same pixels as make_canvas(mask).
+/** @type {PixelCanvas | null} */
+let mask_fill_scratch = null;
+/** @param {PixelCanvas} source */
+function mask_fill_canvas_from(source) {
+	if (!mask_fill_scratch || mask_fill_scratch.width !== source.width || mask_fill_scratch.height !== source.height) {
+		mask_fill_scratch = make_canvas(source.width, source.height);
+	} else {
+		const ctx = mask_fill_scratch.ctx;
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.globalCompositeOperation = "source-over";
+		ctx.globalAlpha = 1;
+		ctx.clearRect(0, 0, source.width, source.height);
+	}
+	mask_fill_scratch.ctx.drawImage(source, 0, 0);
+	return mask_fill_scratch;
+}
+
 const tools = [{
 	id: TOOL_FREE_FORM_SELECT,
 	name: localize("Free-Form Select"),
@@ -809,7 +828,10 @@ const tools = [{
 	description: localize("Inserts text into the picture."),
 	cursor: ["precise", [16, 16], "crosshair"],
 	preload() {
-		setTimeout(FontDetective.preload, 10);
+		// (not when replaying: text pixels come from the recording)
+		if (!window.P95.replaying) {
+			setTimeout(FontDetective.preload, 10);
+		}
 	},
 	selectBox(rect_x, rect_y, rect_width, rect_height) {
 		if (rect_width > 1 && rect_height > 1) {
@@ -1451,7 +1473,7 @@ tools.forEach((tool) => {
 				color = gradient;
 			}
 			// @TODO: perf: keep this canvas around too
-			const mask_fill_canvas = make_canvas(tool.mask_canvas);
+			const mask_fill_canvas = mask_fill_canvas_from(tool.mask_canvas);
 			replace_colors_with_swatch(mask_fill_canvas.ctx, color, 0, 0);
 			ctx.drawImage(mask_fill_canvas, 0, 0);
 			return translucent;
@@ -1559,7 +1581,7 @@ tools.forEach((tool) => {
 				color = gradient;
 			}
 			// @TODO: perf: keep this canvas around too
-			const mask_fill_canvas = make_canvas(tool.mask_canvas);
+			const mask_fill_canvas = mask_fill_canvas_from(tool.mask_canvas);
 			if (previewing && tool.dynamic_preview_cursor) {
 				const brush = tool.get_brush();
 				// dynamic cursor preview:

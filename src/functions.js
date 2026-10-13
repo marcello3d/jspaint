@@ -168,6 +168,11 @@ function update_helper_layer(e) {
 	if (e && isFinite(e.clientX)) {
 		info_for_updating_pointer = { clientX: e.clientX, clientY: e.clientY, devicePixelRatio };
 	}
+	// 2draw: replay (the player, and restoring a revision's history) shows nothing through the helper layer
+	// (the player renders its own view), so don't spend time drawing tool previews there.
+	if (window.P95.replaying) {
+		return;
+	}
 	if (helper_layer_update_queued) {
 		// window.console?.log("update_helper_layer - nah, already queued");
 		return;
