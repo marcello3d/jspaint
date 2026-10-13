@@ -2134,6 +2134,15 @@ function undoable({ name, icon, use_loose_canvas_changes, soft, assume_saved }, 
 	current_history_node.futures.push(new_history_node);
 	current_history_node = new_history_node;
 
+	// 2draw: bound the memory of the history (each step is a full snapshot of the canvas). Deterministic, so
+	// replay and the history restore do the same. (P95 ENGINE_BEHAVIOR 3)
+	if (window.P95.behavior >= 3) {
+		const keep = window.P95.history_keep_for(main_canvas.width, main_canvas.height);
+		if (history_nodes_by_id.size > 2 * keep) {
+			window.P95.prune_history(keep);
+		}
+	}
+
 	$G.triggerHandler("history-update"); // update history view
 
 	$G.triggerHandler("session-update"); // autosave
@@ -4327,6 +4336,13 @@ window.P95.snap_to_picture = (image_data) => {
 		$canvas_area.trigger("resize");
 	});
 };
+/**
+ * How many undo steps to keep when pruning: about 128 MB of snapshots, 10–100 steps.
+ * Part of the engine's recorded behavior: changing it needs an ENGINE_BEHAVIOR bump.
+ * @param {number} width
+ * @param {number} height
+ */
+window.P95.history_keep_for = (width, height) => Math.max(10, Math.min(100, Math.floor(128 * 1024 * 1024 / (width * height * 4))));
 /** For the history restore's memory budget */
 window.P95.history_size = () => history_nodes_by_id.size;
 window.P95.reset_history_keeping_canvas = () => {

@@ -172,7 +172,7 @@ file starts fresh with the `load` image as an `image` start.
 
 When revising, the editor always resumes from the previous recording: it replays the file's segments itself
 (`src/paint95-restore.js`, time-sliced, with a "Restoring history" progress box that can't be skipped), so undo can step
-back into earlier sessions, then prunes the history to the last `keep` steps (about 256 MB of snapshots, 10–100 steps).
+back into earlier sessions, then prunes the history to the last `keep` steps (about 128 MB of snapshots, 10–100 steps; since ENGINE_BEHAVIOR 3 the engine also prunes to that whenever the history holds twice as many steps, while editing and replaying).
 The new segment is `continue` with `history: true`; replay does the same prune at that point instead of resetting the
 history.
 

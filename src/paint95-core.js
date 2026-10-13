@@ -15,8 +15,10 @@
 	 * 1: initial (software polygon rasterizer instead of WebGL, seeded airbrush, text/transform snapshots)
 	 * 2: rotate and stretch/skew are software nearest-neighbor (no stored pixels); behavior-1 recordings still
 	 *    replay the old way, using their stored pixels
+	 * 3: the undo history is capped (pruned to P95.history_keep_for steps once it holds twice that many),
+	 *    so memory stays bounded while editing, replaying and restoring
 	 */
-	const ENGINE_BEHAVIOR = 2;
+	const ENGINE_BEHAVIOR = 3;
 
 	/** mulberry32 */
 	function make_prng(seed) {

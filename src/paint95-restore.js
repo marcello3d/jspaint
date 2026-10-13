@@ -12,15 +12,13 @@ import { E } from "./helpers.js";
 import { hash_image_data } from "./paint95-format.js";
 import { ReplayController } from "./paint95-replay.js";
 
-/** Undo steps kept after restoring: about this much memory of snapshots */
-const KEEP_BYTES = 256 * 1024 * 1024;
-
 /**
+ * Undo steps kept after restoring (the engine's own history limit; see P95.history_keep_for)
  * @param {number} width
  * @param {number} height
  */
 export function history_keep_for(width, height) {
-	return Math.max(10, Math.min(100, Math.floor(KEEP_BYTES / (width * height * 4))));
+	return window.P95.history_keep_for(width, height);
 }
 
 /**
