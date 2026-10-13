@@ -843,8 +843,8 @@ function make_history_patch(before, after, owned = false) {
 	}
 	const w = x_max - x_min + 1;
 	const h = y_max - y_min + 1;
-	if (owned && w === width && h === after.height) {
-		return { x: 0, y: 0, before, after, full: false }; // (the whole area changed: no need to copy)
+	if (owned && w * h > 0.75 * width * after.height) {
+		return { x: 0, y: 0, before, after, full: false }; // (most of the area changed: keep it rather than copy)
 	}
 	return { x: x_min, y: y_min, before: crop_image_data(before, x_min, y_min, w, h), after: crop_image_data(after, x_min, y_min, w, h), full: false };
 }
@@ -1121,15 +1121,26 @@ function make_history_node({
 	if (image_data === INCREMENTAL) {
 		// only the dirty rectangle changed since the parent (the anchor)
 		const r = history_dirty.rect;
-		if (r) {
-			const w = r.x1 - r.x0;
-			const h = r.y1 - r.y0;
-			const before = crop_image_data(history_anchor.image, r.x0, r.y0, w, h);
-			const after = main_ctx.getImageData(r.x0, r.y0, w, h);
-			paste_image_data(history_anchor.image, after, r.x0, r.y0);
-			node.patch = make_history_patch_at(before, after, r.x0, r.y0);
+		const image = history_anchor.image;
+		if (r && r.x0 <= 0 && r.y0 <= 0 && r.x1 >= image.width && r.y1 >= image.height) {
+			// everything may have changed: the old picture becomes the patch's "before" (no copies if it all changed)
+			const after = main_ctx.getImageData(0, 0, image.width, image.height);
+			node.patch = make_history_patch(image, after, true);
+			if (node.patch.after === after) {
+				node.patch.after = clone_image_data(after); // (the anchor's picture changes in place later)
+			}
+			history_anchor = { node, image: after };
+		} else {
+			if (r) {
+				const w = r.x1 - r.x0;
+				const h = r.y1 - r.y0;
+				const before = crop_image_data(image, r.x0, r.y0, w, h);
+				const after = main_ctx.getImageData(r.x0, r.y0, w, h);
+				paste_image_data(image, after, r.x0, r.y0);
+				node.patch = make_history_patch_at(before, after, r.x0, r.y0);
+			}
+			history_anchor = { node, image };
 		}
-		history_anchor = { node, image: history_anchor.image };
 		history_dirty_reset();
 		debug_check_anchor();
 	} else if (image_data) {

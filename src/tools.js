@@ -146,10 +146,16 @@ let mask_fill_scratch = null;
  * @returns {{ x0: number, y0: number, x1: number, y1: number } | null} null: nothing to render
  */
 function mask_render_rect(mask, whole) {
+	const all = { x0: 0, y0: 0, x1: mask.width, y1: mask.height };
 	if (whole || mask.content_bounds === undefined) {
-		return { x0: 0, y0: 0, x1: mask.width, y1: mask.height };
+		return all;
 	}
-	return mask.content_bounds;
+	const b = mask.content_bounds;
+	// (drawing a part of a canvas is slower per pixel than drawing all of it: only worth it for a smaller part)
+	if (b && (b.x1 - b.x0) * (b.y1 - b.y0) > 0.4 * mask.width * mask.height) {
+		return all;
+	}
+	return b;
 }
 /**
  * A copy of part of a mask on the scratch canvas (positioned at r.x0, r.y0 when drawn back).
