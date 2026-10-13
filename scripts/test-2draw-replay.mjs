@@ -1012,6 +1012,29 @@ async function test_history_patches_with(name) {
 	const page = await browser.newPage({ viewport: { width: 1024, height: 700 } });
 	watch(page, `patches/${name}`);
 	await record_session(page, { width: 320, height: 240, script: sessions[name], debug: true });
+	// the history window (Edit > History) lists the steps and jumps to them
+	await page.keyboard.press("Control+Shift+Y");
+	await page.waitForSelector(".history-window .history-entry");
+	const entries = await page.$$(".history-window .history-entry");
+	const window_check = { entries: entries.length, ok: 0, bad: 0 };
+	for (const index of [1, Math.floor(entries.length / 2), entries.length - 1]) {
+		const entry = (await page.$$(".history-window .history-entry"))[index];
+		if (!entry) continue;
+		await entry.click();
+		const ok = await page.evaluate(() => {
+			const expected = window.P95.debug_history_hashes.get(current_history_node.id);
+			if (expected === undefined) return null;
+			const d = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+			const words = new Uint32Array(d.data.buffer);
+			let h = 0x811c9dc5 ^ d.width ^ (d.height << 16);
+			for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+			return (h >>> 0) === expected;
+		});
+		if (ok === true) window_check.ok++;
+		if (ok === false) window_check.bad++;
+	}
+	check(window_check.entries > 5 && window_check.ok > 0 && window_check.bad === 0, `patches: ${name}: the history window jumps to steps with their exact pictures (${JSON.stringify(window_check)})`);
+	await page.keyboard.press("Escape");
 	const result = await page.evaluate(() => {
 		const hash = () => {
 			const d = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
