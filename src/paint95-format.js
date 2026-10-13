@@ -3,8 +3,11 @@
 // JSPaint.exe animation files (.p95): container encoding/decoding and canvas hashing.
 // See docs/2draw-animation-format.md
 
+import { decode_events, encode_events } from "./paint95-events.js";
+
 export const MAGIC = "P95A";
-export const CONTAINER_VERSION = 1;
+/** 2: binary event streams (paint95-events.js); 1 (JSON events) is still read */
+export const CONTAINER_VERSION = 2;
 export const FORMAT_VERSION = 1;
 
 /**
@@ -49,13 +52,31 @@ export function hash_image_data(image_data) {
 }
 
 /**
+ * Writes the container: magic, version, u32 LE header length, deflated JSON header,
+ * [v2: per segment u32 LE length + event payload,] u32 LE blob count, (u32 LE length, bytes)*.
  * @param {P95File} file
+ * @param {number} [version] - 2 (default); 1 only for tests/tools
  * @returns {Uint8Array}
  */
-export function encode_p95(file) {
-	const json_bytes = new TextEncoder().encode(JSON.stringify(file.header));
+export function encode_p95(file, version = CONTAINER_VERSION) {
+	let header = file.header;
+	/** @type {Uint8Array[]} */
+	const event_payloads = [];
+	if (version >= 2) {
+		header = {
+			...file.header,
+			segments: file.header.segments.map((segment) => {
+				event_payloads.push(encode_event_payload(segment.events));
+				return { ...segment, events: null, event_count: segment.events.length };
+			}),
+		};
+	}
+	const json_bytes = new TextEncoder().encode(JSON.stringify(header));
 	const deflated = pako.deflate(json_bytes);
 	let total = 8 + 4 + deflated.length + 4;
+	for (const payload of event_payloads) {
+		total += 4 + payload.length;
+	}
 	for (const blob of file.blobs) {
 		total += 4 + blob.length;
 	}
@@ -64,21 +85,67 @@ export function encode_p95(file) {
 	for (let i = 0; i < 4; i++) {
 		out[i] = MAGIC.charCodeAt(i);
 	}
-	out[4] = CONTAINER_VERSION;
+	out[4] = version;
 	let offset = 8;
-	view.setUint32(offset, deflated.length, true);
-	offset += 4;
-	out.set(deflated, offset);
-	offset += deflated.length;
+	const put = (bytes) => {
+		view.setUint32(offset, bytes.length, true);
+		offset += 4;
+		out.set(bytes, offset);
+		offset += bytes.length;
+	};
+	put(deflated);
+	for (const payload of event_payloads) {
+		put(payload);
+	}
 	view.setUint32(offset, file.blobs.length, true);
 	offset += 4;
 	for (const blob of file.blobs) {
-		view.setUint32(offset, blob.length, true);
-		offset += 4;
-		out.set(blob, offset);
-		offset += blob.length;
+		put(blob);
 	}
 	return out;
+}
+
+/**
+ * [u8 compression: 0 none, 1 zlib][event streams, possibly deflated]
+ * @param {any[][]} events
+ */
+function encode_event_payload(events) {
+	const raw = encode_events(events);
+	const deflated = pako.deflate(raw);
+	const compress = deflated.length < raw.length;
+	const data = compress ? deflated : raw;
+	const out = new Uint8Array(1 + data.length);
+	out[0] = compress ? 1 : 0;
+	out.set(data, 1);
+	return out;
+}
+
+/** @param {Uint8Array} payload */
+function decode_event_payload(payload) {
+	const data = payload.subarray(1);
+	return decode_events(payload[0] === 1 ? pako.inflate(data) : data);
+}
+
+/**
+ * Sizes of the parts of an encoded file (for measuring).
+ * @param {Uint8Array} bytes
+ */
+export function p95_section_sizes(bytes) {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	let offset = 8;
+	const header_length = view.getUint32(offset, true);
+	offset += 4 + header_length;
+	let events = 0;
+	if (bytes[4] >= 2) {
+		const header = JSON.parse(new TextDecoder().decode(pako.inflate(bytes.subarray(12, 12 + header_length))));
+		for (let i = 0; i < header.segments.length; i++) {
+			const length = view.getUint32(offset, true);
+			events += 4 + length;
+			offset += 4 + length;
+		}
+	}
+	const blob_start = offset;
+	return { total: bytes.length, header: 12 + header_length, events, blobs: bytes.length - blob_start };
 }
 
 /**
@@ -92,27 +159,35 @@ export function decode_p95(buffer) {
 	if (magic !== MAGIC) {
 		throw new Error("Not a JSPaint.exe animation (bad magic)");
 	}
-	if (bytes[4] !== CONTAINER_VERSION) {
-		throw new Error(`Unsupported animation container version ${bytes[4]}`);
+	const version = bytes[4];
+	if (version !== 1 && version !== 2) {
+		throw new Error(`Unsupported animation container version ${version}`);
 	}
 	let offset = 8;
-	const json_length = view.getUint32(offset, true);
-	offset += 4;
-	const header = JSON.parse(new TextDecoder().decode(pako.inflate(bytes.subarray(offset, offset + json_length))));
-	offset += json_length;
+	const take = () => {
+		const length = view.getUint32(offset, true);
+		offset += 4;
+		const out = bytes.subarray(offset, offset + length);
+		offset += length;
+		return out;
+	};
+	const header = JSON.parse(new TextDecoder().decode(pako.inflate(take())));
 	if (header.format !== FORMAT_VERSION) {
 		throw new Error(`Unsupported animation format version ${header.format}`);
+	}
+	if (version >= 2) {
+		for (const segment of header.segments) {
+			segment.events = decode_event_payload(take());
+			delete segment.event_count;
+		}
 	}
 	const blob_count = view.getUint32(offset, true);
 	offset += 4;
 	const blobs = [];
 	for (let i = 0; i < blob_count; i++) {
-		const length = view.getUint32(offset, true);
-		offset += 4;
-		blobs.push(bytes.slice(offset, offset + length));
-		offset += length;
+		blobs.push(take().slice());
 	}
-	return { header, blobs };
+	return { header, blobs, version };
 }
 
 /**

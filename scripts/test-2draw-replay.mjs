@@ -538,7 +538,13 @@ async function test_host_submit_and_continue() {
 	check(!!first.p95, "continue: host received an animation with the first submit");
 	check(first.p95 && String.fromCharCode(...first.p95.slice(0, 4)) === "P95A", "continue: animation has the P95A magic");
 	files.png = Buffer.from(first.png);
-	files.p95 = Buffer.from(first.p95);
+	// serve the previous recording as a v1 file (production has those): continuing must convert it to v2 losslessly
+	const first_v1 = await with_format((format, b64, base64) => {
+		const file = format.decode_p95(b64.decode(base64));
+		return { base64: b64.encode(format.encode_p95(file, 1)), events: JSON.stringify(file.header.segments.map((x) => x.events)) };
+	}, Buffer.from(first.p95).toString("base64"));
+	files.p95 = Buffer.from(first_v1.base64, "base64");
+	check(files.p95[4] === 1 && first.p95[4] === 2, `continue: the editor writes v2 (${first.p95[4]}); the previous file is served as v1 (${files.p95[4]})`);
 
 	// session 2, continuing: the undo history of session 1 is restored; undo past the session boundary, then draw
 	const restore_log = [];
@@ -579,6 +585,11 @@ async function test_host_submit_and_continue() {
 	const header = JSON.parse(zlib.inflateSync(p95.subarray(12, 12 + p95.readUInt32LE(8))).toString());
 	check(header.segments.length === 2 && header.segments[1].start.type === "continue" && header.segments[1].start.history === true, `continue: the new file holds both sessions (${header.segments.map((x) => x.start.type)})`);
 	console.log(`continue: ${p95.length} bytes for 2 sessions`);
+	const continued = await with_format((format, b64, base64) => {
+		const file = format.decode_p95(b64.decode(base64));
+		return { version: file.version, first_segment: JSON.stringify([file.header.segments[0].events]) };
+	}, p95.toString("base64"));
+	check(continued.version === 2 && continued.first_segment === first_v1.events, "continue: continuing a v1 file wrote v2 with the old session's events unchanged");
 
 	const player_page = await browser.newPage({ viewport: { width: 800, height: 600 } });
 	watch(player_page, "continue/player");
@@ -613,28 +624,34 @@ async function measure_restore(name, recording, width, height) {
 	check(state.start.history === true && !/p95nohistory/.test(state.url), `${name}: revising restores the undo history (${state.undos} undo steps; ${log.join("; ")})`);
 }
 
-/** .p95 container helpers (see docs/2draw-animation-format.md) */
-function p95_decode(buffer) {
-	const json_length = buffer.readUInt32LE(8);
-	const header = JSON.parse(zlib.inflateSync(buffer.subarray(12, 12 + json_length)).toString());
-	let offset = 12 + json_length;
-	const count = buffer.readUInt32LE(offset);
-	offset += 4;
-	const blobs = [];
-	for (let i = 0; i < count; i++) {
-		const length = buffer.readUInt32LE(offset);
-		blobs.push(buffer.subarray(offset + 4, offset + 4 + length));
-		offset += 4 + length;
+/**
+ * Runs fn(format_module, arg) in a page that has the app's .p95 format module (src/paint95-format.js) loaded.
+ */
+async function with_format(fn, arg) {
+	const page = await browser.newPage();
+	watch(page, "format");
+	await page.route(`${base}/__format_host.html`, (route) => route.fulfill({
+		contentType: "text/html",
+		body: `<!doctype html><meta charset="utf-8"><script src="lib/pako-2.0.3.min.js"></script><script src="lib/UPNG.js"></script>`,
+	}));
+	await page.goto(`${base}/__format_host.html`, { waitUntil: "load" });
+	try {
+		return await page.evaluate(async ({ source, arg }) => {
+			const format = await import("./src/paint95-format.js");
+			const b64 = {
+				decode: (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0)),
+				encode: (bytes) => {
+					let binary = "";
+					for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+					return btoa(binary);
+				},
+			};
+			// eslint-disable-next-line no-new-func
+			return new Function("format", "b64", "arg", `return (${source})(format, b64, arg);`)(format, b64, arg);
+		}, { source: fn.toString(), arg });
+	} finally {
+		await page.close();
 	}
-	return { header, blobs };
-}
-function p95_encode({ header, blobs }) {
-	const json = zlib.deflateSync(Buffer.from(JSON.stringify(header)));
-	const parts = [Buffer.from("P95A"), Buffer.from([1, 0, 0, 0])];
-	const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
-	parts.push(u32(json.length), json, u32(blobs.length));
-	for (const blob of blobs) parts.push(u32(blob.length), blob);
-	return Buffer.concat(parts);
 }
 
 /**
@@ -663,13 +680,16 @@ async function test_playback_timing() {
 	});
 	await editor.close();
 	// insert an artificial 10 s pause before the second stroke
-	const file = p95_decode(Buffer.from(recording.base64, "base64"));
-	const events = file.header.segments[0].events;
-	const downs = events.map((event, i) => (event[0] === "d" ? i : -1)).filter((i) => i >= 0);
-	const ups = events.map((event, i) => (event[0] === "u" ? i : -1)).filter((i) => i >= 0);
-	events[downs[1]][1] += 10000;
-	const first_stroke_recorded = events.slice(downs[0] + 1, ups[0] + 1).reduce((sum, event) => sum + event[1], 0);
-	const modified = { ...recording, base64: p95_encode(file).toString("base64") };
+	const { base64, downs, ups, first_stroke_recorded } = await with_format(async (format, b64, base64) => {
+		const file = format.decode_p95(b64.decode(base64));
+		const events = file.header.segments[0].events;
+		const downs = events.map((event, i) => (event[0] === "d" ? i : -1)).filter((i) => i >= 0);
+		const ups = events.map((event, i) => (event[0] === "u" ? i : -1)).filter((i) => i >= 0);
+		events[downs[1]][1] += 10000;
+		const first_stroke_recorded = events.slice(downs[0] + 1, ups[0] + 1).reduce((sum, event) => sum + event[1], 0);
+		return { base64: b64.encode(format.encode_p95(file)), downs, ups, first_stroke_recorded };
+	}, recording.base64);
+	const modified = { ...recording, base64 };
 
 	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
 	watch(page, "timing/player");
@@ -784,6 +804,63 @@ async function test_mid_stroke_ink() {
 	}
 }
 
+/**
+ * v1 <-> v2 round trip on the test logs and a real production v1 file: events decode identically,
+ * and the v2 conversion replays to the same picture. Reports sizes.
+ */
+async function test_format_v1_v2(recordings) {
+	const logs = { ...recordings };
+	try {
+		const response = await fetch("https://s3.amazonaws.com/zoraw.2draw.net/data/13/132726/132726-v1.p95");
+		if (response.ok) {
+			logs["132726"] = { base64: Buffer.from(await response.arrayBuffer()).toString("base64") };
+		} else {
+			console.log(`format: couldn't fetch 132726-v1.p95 (HTTP ${response.status}); skipping it`);
+		}
+	} catch (error) {
+		console.log(`format: couldn't fetch 132726-v1.p95 (${error.message}); skipping it`);
+	}
+	for (const [name, log] of Object.entries(logs)) {
+		const result = await with_format((format, b64, base64) => {
+			const original = format.decode_p95(b64.decode(base64));
+			const events_json = JSON.stringify(original.header.segments.map((x) => x.events));
+			const header_json = (file) => JSON.stringify({ ...file.header, segments: file.header.segments.map((x) => ({ ...x, events: undefined })) });
+			const v1 = format.encode_p95(original, 1);
+			const v2 = format.encode_p95(original, 2);
+			const from_v1 = format.decode_p95(v1);
+			const from_v2 = format.decode_p95(v2);
+			// and back: v2 -> v1
+			const back_to_v1 = format.decode_p95(format.encode_p95(from_v2, 1));
+			const same = (file) => JSON.stringify(file.header.segments.map((x) => x.events)) === events_json && header_json(file) === header_json(original) &&
+				file.blobs.length === original.blobs.length && file.blobs.every((blob, i) => blob.length === original.blobs[i].length && blob.every((byte, j) => byte === original.blobs[i][j]));
+			const sizes = (bytes) => format.p95_section_sizes(bytes);
+			const s1 = sizes(v1);
+			const s2 = sizes(v2);
+			return {
+				original_version: original.version,
+				ok: same(from_v1) && same(from_v2) && same(back_to_v1),
+				events: original.header.segments.reduce((n, x) => n + x.events.length, 0),
+				v1: { total: s1.total, events_and_header: s1.header, blobs: s1.blobs },
+				v2: { total: s2.total, header: s2.header, events: s2.events, blobs: s2.blobs },
+				v2_base64: b64.encode(v2),
+			};
+		}, log.base64);
+		check(result.ok, `format: ${name} (v${result.original_version}, ${result.events} events) decodes identically from v1 and v2, and v2 -> v1`);
+		console.log(`format: ${name}: v1 ${result.v1.total} bytes (events+header ${result.v1.events_and_header}, blobs ${result.v1.blobs}); v2 ${result.v2.total} bytes (header ${result.v2.header}, events ${result.v2.events}, blobs ${result.v2.blobs})`);
+		if (name === "132726") {
+			const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+			watch(page, "format/132726");
+			const replay_v1 = await replay_session(page, log);
+			const replay_v2 = await replay_session(page, { base64: result.v2_base64 });
+			await page.close();
+			check(replay_v1.drifts.length === 0 && replay_v2.drifts.length === 0, `format: 132726 replays without drift from v1 and v2 (${replay_v1.drifts.length}, ${replay_v2.drifts.length})`);
+			compare("format: 132726 v2 vs v1 replay", replay_v1, replay_v2);
+		}
+	}
+}
+
+const recordings = {};
+
 try {
 	for (const [name, script] of Object.entries(sessions)) {
 		if (only && !name.includes(only)) continue;
@@ -798,6 +875,7 @@ try {
 		const replay = await replay_session(player_page, recording, { seek_back: name === "all_tools" });
 		await player_page.close();
 		compare(name, recording, replay);
+		recordings[name] = recording;
 		if (name === "all_tools" || name === "typical") {
 			await measure_restore(name, recording, 320, 240);
 		}
@@ -813,6 +891,9 @@ try {
 	}
 	if (!only || "timing".includes(only)) {
 		await test_playback_timing();
+	}
+	if (!only || "format".includes(only)) {
+		await test_format_v1_v2(recordings);
 	}
 } finally {
 	await browser.close();
