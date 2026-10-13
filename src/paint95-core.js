@@ -17,8 +17,9 @@
 	 *    replay the old way, using their stored pixels
 	 * 3: the undo history is capped (pruned to P95.history_keep_for steps once it holds twice that many),
 	 *    so memory stays bounded while editing, replaying and restoring
+	 * 4: history steps are patches; the history is trimmed by the memory its steps hold (96 MB), not by step count
 	 */
-	const ENGINE_BEHAVIOR = 3;
+	const ENGINE_BEHAVIOR = 4;
 
 	/** mulberry32 */
 	function make_prng(seed) {

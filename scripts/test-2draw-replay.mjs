@@ -141,9 +141,9 @@ function watch(page, label) {
 /**
  * @param {import("playwright-core").Page} page
  */
-async function record_session(page, { width, height, script }) {
-	await page.goto(`${base}/index.html?w=${width}&h=${height}${process.argv.includes("--debug") ? "&p95debug=1" : ""}`, { waitUntil: "networkidle" });
-	await page.waitForFunction(() => window.P95 && window.P95.recorder);
+async function record_session(page, { width, height, script, debug = false }) {
+	await page.goto(`${base}/index.html?w=${width}&h=${height}${process.argv.includes("--debug") || debug ? "&p95debug=1" : ""}`, { waitUntil: "networkidle" });
+	await wait_until(page, () => !!(window.P95 && window.P95.recorder));
 	const canvas_box = async () => (await page.$(".main-canvas")).boundingBox();
 	const ctx = {
 		page,
@@ -516,7 +516,7 @@ async function test_host_submit_and_continue() {
 		return route.fulfill({ contentType: "text/html", body: host_html(query) });
 	});
 	const draw_in_frame = async (frame, points, tool) => {
-		await frame.waitForFunction(() => window.P95 && window.P95.recorder);
+		await wait_until(frame, () => !!(window.P95 && window.P95.recorder));
 		await frame.click(`.tools-component .tool[title="${tool}"]`);
 		const box = await (await frame.$(".main-canvas")).boundingBox();
 		const scale = box.width / 200;
@@ -556,7 +556,7 @@ async function test_host_submit_and_continue() {
 	page.on("console", (message) => { if (/Restored the undo history|Couldn't restore/.test(message.text())) restore_log.push(message.text()); });
 	await page.goto(`${base}/__host2`);
 	frame = await frame_of();
-	await frame.waitForFunction(() => window.P95 && window.P95.recorder);
+	await wait_until(frame, () => !!(window.P95 && window.P95.recorder));
 	const restored = await frame.evaluate(() => ({ undos: undos.length, url: location.search }));
 	check(restored.undos >= 2 && !/p95nohistory/.test(restored.url), `continue: session 1's undo history was restored (${restored.undos} undo steps; ${restore_log.join("; ")})`);
 	await draw_in_frame(frame, [[60, 60], [70, 70]], "Pencil");
@@ -707,6 +707,18 @@ async function measure_restore(name, recording, width, height) {
 	const state = await frame.evaluate(() => ({ undos: undos.length, url: location.search, start: window.P95.recorder.segment.start }));
 	await page.close();
 	check(state.start.history === true && !/p95nohistory/.test(state.url), `${name}: revising restores the undo history (${state.undos} undo steps; ${log.join("; ")})`);
+}
+
+/**
+ * Polls fn in a frame or page (frame.waitForFunction can fall back to string evaluation, which the app's CSP blocks).
+ */
+async function wait_until(frame, fn, timeout = 30000) {
+	const end = Date.now() + timeout;
+	while (Date.now() < end) {
+		if (await frame.evaluate(fn).catch(() => false)) return;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	throw new Error("wait_until: timed out");
 }
 
 /**
@@ -987,32 +999,103 @@ async function test_no_font_permission(recording_with_text) {
 	check(replay.ended && calls === 0, `fonts: playing a recording with text doesn't call queryLocalFonts (${calls} calls)`);
 }
 
-/** ENGINE_BEHAVIOR 3: on a big canvas the history is pruned while drawing; undo past the limit replays identically. */
-async function test_history_cap() {
-	const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
-	watch(editor, "historycap/editor");
-	const width = 1600;
-	const height = 1600; // 10 MB per step: keep 12, pruned at 25
-	const recording = await record_session(editor, {
-		width, height, script: async (t) => {
-			await t.tool("Pencil");
-			for (let i = 0; i < 30; i++) {
-				await t.drag([[5 + i * 3, 5], [5 + i * 3, 40]]);
-			}
-			for (let i = 0; i < 20; i++) {
-				await t.page.keyboard.press("Control+z");
-			}
-			await t.drag([[10, 60], [100, 60]]);
-		},
+/**
+ * History steps are stored as patches: going to every step of a varied session must give exactly the picture
+ * that step had when it was made (hashes taken at the time, with &p95debug=1).
+ */
+async function test_history_patches() {
+	for (const name of ["all_tools", "image_menu"]) {
+		await test_history_patches_with(name);
+	}
+}
+async function test_history_patches_with(name) {
+	const page = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(page, `patches/${name}`);
+	await record_session(page, { width: 320, height: 240, script: sessions[name], debug: true });
+	const result = await page.evaluate(() => {
+		const hash = () => {
+			const d = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+			const words = new Uint32Array(d.data.buffer);
+			let h = 0x811c9dc5 ^ d.width ^ (d.height << 16);
+			for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+			return h >>> 0;
+		};
+		const expected = window.P95.debug_history_hashes;
+		const ids = [...expected.keys()];
+		let checked = 0;
+		const mismatches = [];
+		// visit in a scrambled order, so pictures are rebuilt from all directions of the tree
+		const order = ids.map((id, i) => ids[(i * 7) % ids.length]);
+		for (const id of [...order, ...ids.reverse()]) {
+			window.P95.commands.go_to_history_node(id, false);
+			if (current_history_node.id !== id) continue; // (pruned or discarded)
+			checked++;
+			if (hash() !== expected.get(id)) mismatches.push(id);
+		}
+		return { steps: ids.length, checked, mismatches, stats: window.P95.history_stats(), anchor_mismatches: window.P95.debug_anchor_mismatches || 0, captures: window.P95.debug_captures };
 	});
-	const nodes = await editor.evaluate(() => window.P95.history_size()).catch(() => -1);
-	await editor.close();
-	check(nodes > 0 && nodes <= 2 * 12 + 1, `historycap: the history is capped while drawing (${nodes} steps kept)`);
-	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
-	watch(page, "historycap/player");
-	const replay = await replay_session(page, recording);
 	await page.close();
-	compare("historycap", recording, replay);
+	check(result.anchor_mismatches === 0 && result.captures.incremental > 5, `patches: ${name}: steps read back only the changed rectangle, and it always matches the canvas (${JSON.stringify(result.captures)}; ${result.anchor_mismatches} mismatches)`);
+	check(result.checked > 10 && result.mismatches.length === 0, `patches: ${name}: every history step rebuilds its exact picture (${result.checked} visits of ${result.steps} steps; mismatches ${JSON.stringify(result.mismatches)}; ${(result.stats.bytes / result.stats.steps / 1024).toFixed(1)} KB per step)`);
+}
+
+/**
+ * The history limit. ENGINE_BEHAVIOR 3 (recordings from before patches): by step count, as if each step were a full
+ * snapshot. ENGINE_BEHAVIOR 4: by the memory the steps hold. Both replay identically, undoing past the limit.
+ */
+async function test_history_cap() {
+	const width = 1600;
+	const height = 1600; // 10 MB per full picture: behavior 3 keeps 13 steps, pruning at 27
+	for (const behavior of [3, 4]) {
+		for (const kind of behavior === 4 ? ["strokes", "fills"] : ["strokes"]) {
+			const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+			watch(editor, `historycap/${behavior}/${kind}`);
+			const recording = await record_session(editor, {
+				width, height, script: async (t) => {
+					await t.page.evaluate((behavior) => {
+						window.P95.behavior = behavior;
+						window.P95.recorder.segment.engine.behavior = behavior;
+					}, behavior);
+					if (kind === "strokes") {
+						await t.tool("Pencil");
+						for (let i = 0; i < 30; i++) {
+							await t.drag([[5 + i * 3, 5], [5 + i * 3, 40]]);
+						}
+					} else {
+						// every fill changes the whole canvas: 20 MB patches, past the 96 MB budget
+						await t.tool("Fill With Color");
+						for (let i = 0; i < 12; i++) {
+							await t.page.evaluate((i) => {
+								selected_colors.foreground = i % 2 ? "rgb(255,0,0)" : "rgb(0,0,255)";
+								$(window).trigger("option-changed");
+							}, i);
+							await t.click(50, 50);
+						}
+					}
+					for (let i = 0; i < 20; i++) {
+						await t.page.keyboard.press("Control+z");
+					}
+					await t.tool("Pencil");
+					await t.drag([[10, 60], [100, 60]]);
+				},
+			});
+			const stats = await editor.evaluate(() => window.P95.history_stats()).catch(() => null);
+			if (process.argv.includes("--verbose")) console.log("DBG", kind, behavior, await editor.evaluate(() => JSON.stringify(window.P95.history_stats())));
+			await editor.close();
+			if (behavior === 3) {
+				check(stats && stats.steps <= 2 * 13 + 1, `historycap: behavior 3 caps the history by step count (${stats && stats.steps} steps kept)`);
+			} else if (kind === "strokes") {
+				check(stats && stats.steps >= 31, `historycap: behavior 4 keeps every small step (${stats && stats.steps} steps, ${stats && (stats.bytes / 1024).toFixed(0)} KB)`);
+			} else {
+				check(stats && stats.steps < 14 && stats.bytes <= 96 * 1024 * 1024, `historycap: behavior 4 trims by memory (${stats && stats.steps} steps, ${stats && (stats.bytes / 1048576).toFixed(0)} MB)`);
+			}
+			const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+			watch(page, `historycap/${behavior}/${kind}/player`);
+			const replay = await replay_session(page, recording);
+			await page.close();
+			compare(`historycap behavior ${behavior} ${kind}`, recording, replay);
+		}
+	}
 }
 
 /** Recordings made with ENGINE_BEHAVIOR 1 (transforms stored as pixels, v1 container) still replay exactly. */
@@ -1116,6 +1199,9 @@ try {
 	}
 	if (wanted("fonts")) {
 		await test_no_font_permission(recordings.all_tools);
+	}
+	if (wanted("patches")) {
+		await test_history_patches();
 	}
 	if (wanted("historycap")) {
 		await test_history_cap();

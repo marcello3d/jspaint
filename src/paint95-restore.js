@@ -21,7 +21,8 @@ const RESTORE_SLICE_MS = 40;
  * @param {number} height
  */
 export function history_keep_for(width, height) {
-	return window.P95.history_keep_for(width, height);
+	// ENGINE_BEHAVIOR 4: steps are patches and the engine trims the history by memory, so keep (nearly) all of it
+	return window.P95.ENGINE_BEHAVIOR >= 4 ? 10000 : window.P95.history_keep_for(width, height);
 }
 
 /**

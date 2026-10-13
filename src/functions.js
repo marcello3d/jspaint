@@ -656,6 +656,7 @@ function reset_canvas_and_history() {
 	redos.length = 0;
 	history_node_counter = 0;
 	history_nodes_by_id.clear();
+	history_anchor = null;
 	current_history_node = root_history_node = make_history_node({
 		name: localize("New"),
 		icon: get_help_folder_icon("p_blank.png"),
@@ -699,10 +700,346 @@ function reset_canvas_and_history() {
  * @param {HTMLImageElement |HTMLCanvasElement | null=} options.icon - a visual representation of the operation type, shown in the history window, e.g. get_help_folder_icon("p_blank.png")
  * @returns {HistoryNode}
  */
+/**
+ * Bytes of pixel data a history step holds (its canvas snapshot or patch, and its floating selection)
+ * @param {HistoryNode} node
+ */
+function history_node_bytes(node) {
+	let bytes = node.selection_image_data ? node.selection_image_data.data.length : 0;
+	if (node.patch !== undefined) {
+		bytes += (node.patch?.before?.data.length || 0) + (node.patch?.after?.data.length || 0);
+	} else if (node.image_data) {
+		bytes += node.image_data.data.length;
+	}
+	return bytes;
+}
+
+/**
+ * &p95debug=1: remember a hash of every history step's picture when it's made, so tests can check that
+ * rebuilding pictures from patches gives exactly the same pixels (P95.debug_history_hashes).
+ * @param {HistoryNode} node
+ */
+function debug_history_snapshot(node) {
+	if (!window.P95.debug) return;
+	const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+	const words = new Uint32Array(image_data.data.buffer, image_data.data.byteOffset, image_data.data.byteLength >> 2);
+	let h = 0x811c9dc5 ^ image_data.width ^ (image_data.height << 16);
+	for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+	(window.P95.debug_history_hashes ??= new Map()).set(node.id, h >>> 0);
+}
+
+/** make_history_node's image_data for "the canvas, which changed only in the dirty rectangle since the parent" */
+const INCREMENTAL = Symbol("incremental");
+
 // 2draw: history nodes get sequential ids so commands like "go to history node" can be recorded and replayed
 let history_node_counter = 0;
 /** @type {Map<number, HistoryNode>} */
 const history_nodes_by_id = new Map();
+
+// #region History pixels as patches
+// 2draw: a history step doesn't keep a full snapshot of the canvas. Exactly one step (the "anchor", normally the
+// current one) has its full picture; every other step stores a patch against its parent: the rectangle that changed,
+// before and after (or both full pictures, when the canvas size changed). A step's picture is rebuilt by walking the
+// tree from the anchor. `node.image_data` stays an ordinary-looking property (a getter/setter), so the rest of the
+// engine is unchanged, and the pixels are exactly the same as with snapshots.
+
+/** @type {{ node: HistoryNode, image: ImageData } | null} */
+let history_anchor = null;
+
+/**
+ * @typedef {{ x: number, y: number, before: ImageData | null, after: ImageData | null, full: boolean }} HistoryPatch
+ */
+
+/** @param {ImageData} image_data */
+function clone_image_data(image_data) {
+	return new ImageData(new Uint8ClampedArray(image_data.data), image_data.width, image_data.height);
+}
+
+/**
+ * @param {ImageData} image_data
+ * @param {number} x
+ * @param {number} y
+ * @param {number} w
+ * @param {number} h
+ */
+function crop_image_data(image_data, x, y, w, h) {
+	const out = new ImageData(w, h);
+	const row = w * 4;
+	for (let j = 0; j < h; j++) {
+		const from = ((y + j) * image_data.width + x) * 4;
+		out.data.set(image_data.data.subarray(from, from + row), j * row);
+	}
+	return out;
+}
+
+/**
+ * Writes `rect` into `image_data` (in place) at x, y.
+ * @param {ImageData} image_data
+ * @param {ImageData} rect
+ * @param {number} x
+ * @param {number} y
+ */
+function paste_image_data(image_data, rect, x, y) {
+	const row = rect.width * 4;
+	for (let j = 0; j < rect.height; j++) {
+		const to = ((y + j) * image_data.width + x) * 4;
+		image_data.data.set(rect.data.subarray(j * row, (j + 1) * row), to);
+	}
+}
+
+/**
+ * The patch that turns `before` into `after`.
+ * @param {ImageData} before
+ * @param {ImageData} after
+ * @param {boolean} [owned] - before and after are fresh copies the patch may keep
+ * @returns {HistoryPatch}
+ */
+function make_history_patch(before, after, owned = false) {
+	if (before.width !== after.width || before.height !== after.height) {
+		return { x: 0, y: 0, before, after, full: true };
+	}
+	const width = after.width;
+	const a = new Uint32Array(before.data.buffer, before.data.byteOffset, before.data.byteLength >> 2);
+	const b = new Uint32Array(after.data.buffer, after.data.byteOffset, after.data.byteLength >> 2);
+	let x_min = Infinity;
+	let y_min = Infinity;
+	let x_max = -1;
+	let y_max = -1;
+	for (let y = 0, i = 0; y < after.height; y++) {
+		let row_min = -1;
+		let row_max = -1;
+		for (let x = 0; x < width; x++, i++) {
+			if (a[i] !== b[i]) {
+				if (row_min < 0) row_min = x;
+				row_max = x;
+			}
+		}
+		if (row_min >= 0) {
+			if (y < y_min) y_min = y;
+			y_max = y;
+			if (row_min < x_min) x_min = row_min;
+			if (row_max > x_max) x_max = row_max;
+		}
+	}
+	if (x_max < 0) {
+		return { x: 0, y: 0, before: null, after: null, full: false };
+	}
+	const w = x_max - x_min + 1;
+	const h = y_max - y_min + 1;
+	if (owned && w === width && h === after.height) {
+		return { x: 0, y: 0, before, after, full: false }; // (the whole area changed: no need to copy)
+	}
+	return { x: x_min, y: y_min, before: crop_image_data(before, x_min, y_min, w, h), after: crop_image_data(after, x_min, y_min, w, h), full: false };
+}
+
+/**
+ * @param {ImageData} image_data - owned by the caller (may be modified and returned)
+ * @param {HistoryPatch} patch
+ * @param {"before" | "after"} side
+ * @returns {ImageData}
+ */
+function apply_history_patch(image_data, patch, side) {
+	const rect = patch[side];
+	if (patch.full) {
+		return clone_image_data(rect);
+	}
+	if (rect) {
+		paste_image_data(image_data, rect, patch.x, patch.y);
+	}
+	return image_data;
+}
+
+/**
+ * The full picture of a history step, rebuilt from the anchor. (Returns the anchor's own ImageData for the anchor:
+ * don't modify it.)
+ * @param {HistoryNode} node
+ * @returns {ImageData | null}
+ */
+function history_image_of(node) {
+	if (!history_anchor) {
+		return null;
+	}
+	if (history_anchor.node === node) {
+		return history_anchor.image;
+	}
+	// path: anchor up to the common ancestor, then down to the node
+	const up = [];
+	for (let n = history_anchor.node; n; n = n.parent) {
+		up.push(n);
+	}
+	const up_index = new Map(up.map((n, i) => [n, i]));
+	const down = [];
+	let n = node;
+	while (n && !up_index.has(n)) {
+		down.push(n);
+		n = n.parent;
+	}
+	if (!n) {
+		return null; // not in the anchor's tree
+	}
+	let image = clone_image_data(history_anchor.image);
+	for (let i = 0; i < up_index.get(n); i++) {
+		if (up[i].patch) {
+			image = apply_history_patch(image, up[i].patch, "before");
+		}
+	}
+	for (let i = down.length - 1; i >= 0; i--) {
+		if (down[i].patch) {
+			image = apply_history_patch(image, down[i].patch, "after");
+		}
+	}
+	return image;
+}
+
+// What changed on the main canvas since it last matched the anchor's picture (helpers.js track_canvas_bounds):
+// lets history steps read back only that rectangle.
+const history_dirty = { full: true, /** @type {{ x0: number, y0: number, x1: number, y1: number } | null} */ rect: null };
+function history_dirty_reset() {
+	history_dirty.full = false;
+	history_dirty.rect = null;
+}
+/** Called once the main canvas exists (app.js). */
+function install_history_dirty_tracking() {
+	main_canvas.on_draw = (rect) => {
+		if (!rect) {
+			history_dirty.full = true;
+		} else if (!history_dirty.full) {
+			const r = history_dirty.rect;
+			history_dirty.rect = r ? { x0: Math.min(r.x0, rect.x0), y0: Math.min(r.y0, rect.y0), x1: Math.max(r.x1, rect.x1), y1: Math.max(r.y1, rect.y1) } : rect;
+		}
+	};
+	history_dirty.full = true;
+}
+
+/**
+ * The patch between two same-size crops, positioned at x, y.
+ * @param {ImageData} before
+ * @param {ImageData} after
+ * @param {number} x
+ * @param {number} y
+ */
+function make_history_patch_at(before, after, x, y) {
+	const patch = make_history_patch(before, after, true);
+	patch.x += x;
+	patch.y += y;
+	return patch;
+}
+
+/**
+ * Whether the main canvas can be captured incrementally for a new step (or an update of) `node` (the anchor).
+ * @param {HistoryNode} node
+ */
+function can_capture_incrementally(node) {
+	return history_anchor && history_anchor.node === node && !history_dirty.full &&
+		history_anchor.image.width === main_canvas.width && history_anchor.image.height === main_canvas.height;
+}
+
+/**
+ * Undo/redo fast path: if the target is the anchor's parent or child (same size, the canvas otherwise matching the
+ * anchor), applies that one patch to the anchor's picture in place. (The caller makes the target the anchor.)
+ * @param {HistoryNode} target
+ * @returns {{ image: ImageData, rect: { x0: number, y0: number, x1: number, y1: number } | null } | null}
+ */
+function history_step_to(target) {
+	if (!history_anchor || history_dirty.full ||
+		history_anchor.image.width !== main_canvas.width || history_anchor.image.height !== main_canvas.height) {
+		return null;
+	}
+	const anchor = history_anchor.node;
+	let patch;
+	let side;
+	if (target === anchor) {
+		return { image: history_anchor.image, rect: null };
+	} else if (target.parent === anchor) {
+		patch = target.patch;
+		side = "after";
+	} else if (anchor.parent === target) {
+		patch = anchor.patch;
+		side = "before";
+	} else {
+		return null;
+	}
+	if (!patch) {
+		return { image: history_anchor.image, rect: null };
+	}
+	if (patch.full) {
+		return null;
+	}
+	const rect = patch[side];
+	if (!rect) {
+		return { image: history_anchor.image, rect: null };
+	}
+	paste_image_data(history_anchor.image, rect, patch.x, patch.y);
+	return { image: history_anchor.image, rect: { x0: patch.x, y0: patch.y, x1: patch.x + rect.width, y1: patch.y + rect.height } };
+}
+
+/** Debug (&p95debug=1): checks that the anchor's picture is exactly the canvas. */
+function debug_check_anchor() {
+	if (!window.P95.debug || !history_anchor) return;
+	const actual = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+	const expected = history_anchor.image;
+	let same = actual.width === expected.width && actual.height === expected.height;
+	for (let i = 0; same && i < actual.data.length; i++) {
+		if (actual.data[i] !== expected.data[i]) same = false;
+	}
+	if (!same) {
+		window.P95.debug_anchor_mismatches = (window.P95.debug_anchor_mismatches || 0) + 1;
+		console.error("history: the anchor's picture doesn't match the canvas");
+	}
+}
+
+/**
+ * Sets a history step's picture (it becomes the anchor), keeping its children's patches valid.
+ * @param {HistoryNode} node
+ * @param {ImageData} image_data
+ */
+function set_history_image(node, image_data) {
+	const children = node.futures.map((child) => [child, history_image_of(child)]);
+	if (node.parent) {
+		const parent_image = history_image_of(node.parent);
+		node.patch = parent_image ? make_history_patch(parent_image, image_data) : null;
+	} else {
+		node.patch = null;
+	}
+	history_anchor = { node, image: image_data };
+	for (const [child, child_image] of children) {
+		if (child_image) {
+			child.patch = make_history_patch(image_data, child_image);
+		}
+	}
+	history_dirty_reset();
+}
+
+/**
+ * The anchor step's picture changed only where the canvas is dirty: update it and its patch from that rectangle.
+ * (For make_or_update_undoable; the step must have no children.)
+ * @param {HistoryNode} node
+ */
+function update_history_image_incrementally(node) {
+	const r = history_dirty.rect;
+	if (r) {
+		const old = node.patch;
+		const u = old && old.before ? {
+			x0: Math.min(r.x0, old.x), y0: Math.min(r.y0, old.y),
+			x1: Math.max(r.x1, old.x + old.before.width), y1: Math.max(r.y1, old.y + old.before.height),
+		} : r;
+		const w = u.x1 - u.x0;
+		const h = u.y1 - u.y0;
+		// the parent's pixels in u: the step's old pixels, with its old patch undone
+		const before = crop_image_data(history_anchor.image, u.x0, u.y0, w, h);
+		if (old && old.before) {
+			paste_image_data(before, old.before, old.x - u.x0, old.y - u.y0);
+		}
+		paste_image_data(history_anchor.image, main_ctx.getImageData(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0), r.x0, r.y0);
+		const after = crop_image_data(history_anchor.image, u.x0, u.y0, w, h);
+		node.patch = node.parent ? make_history_patch_at(before, after, u.x0, u.y0) : null;
+	}
+	history_dirty_reset();
+	debug_check_anchor();
+}
+
+// #endregion
+
 function make_history_node({
 	parent = null, // the state before this state (its basis), or null if this is the first state
 	futures = [], // the states branching off from this state (its children)
@@ -749,6 +1086,40 @@ function make_history_node({
 		name,
 		icon,
 	};
+	// pixels: a patch against the parent (see "History pixels as patches")
+	delete node.image_data;
+	node.patch = null;
+	Object.defineProperty(node, "image_data", {
+		enumerable: true,
+		get: () => history_image_of(node),
+		set: (value) => {
+			if (value) {
+				set_history_image(node, value);
+			}
+		},
+	});
+	if (image_data === INCREMENTAL) {
+		// only the dirty rectangle changed since the parent (the anchor)
+		const r = history_dirty.rect;
+		if (r) {
+			const w = r.x1 - r.x0;
+			const h = r.y1 - r.y0;
+			const before = crop_image_data(history_anchor.image, r.x0, r.y0, w, h);
+			const after = main_ctx.getImageData(r.x0, r.y0, w, h);
+			paste_image_data(history_anchor.image, after, r.x0, r.y0);
+			node.patch = make_history_patch_at(before, after, r.x0, r.y0);
+		}
+		history_anchor = { node, image: history_anchor.image };
+		history_dirty_reset();
+		debug_check_anchor();
+	} else if (image_data) {
+		if (parent && history_anchor) {
+			const parent_image = history_image_of(parent);
+			node.patch = parent_image ? make_history_patch(parent_image, image_data) : null;
+		}
+		history_anchor = { node, image: image_data };
+		history_dirty_reset();
+	}
 	history_nodes_by_id.set(id, node);
 	return node;
 }
@@ -1976,7 +2347,10 @@ function go_to_history_node(target_history_node, canceling) {
 function go_to_history_node_impl(target_history_node, canceling) {
 	const from_history_node = current_history_node;
 
-	if (!target_history_node.image_data) {
+	// 2draw: pictures are patches: stepping to a parent or child (undo/redo) only touches the patch's rectangle
+	const step = history_step_to(target_history_node);
+	const target_image = step ? step.image : history_image_of(target_history_node);
+	if (!target_image) {
 		if (!canceling) {
 			show_error_message("History entry has no image data.");
 			window.console?.log("Target history entry has no image data:", target_history_node);
@@ -1999,7 +2373,19 @@ function go_to_history_node_impl(target_history_node, canceling) {
 	saved = false;
 	update_title();
 
-	main_ctx.copy(target_history_node.image_data);
+	if (step) {
+		// write back only what differs: the patch's rectangle, and anything drawn since the anchor
+		const r = history_dirty.rect;
+		const p = step.rect;
+		const u = r && p ? { x0: Math.min(r.x0, p.x0), y0: Math.min(r.y0, p.y0), x1: Math.max(r.x1, p.x1), y1: Math.max(r.y1, p.y1) } : (r || p);
+		if (u) {
+			main_ctx.putImageData(target_image, 0, 0, u.x0, u.y0, u.x1 - u.x0, u.y1 - u.y0);
+		}
+	} else {
+		main_ctx.copy(target_image);
+	}
+	history_anchor = { node: target_history_node, image: target_image };
+	history_dirty_reset();
 	if (target_history_node.selection_image_data) {
 		if (selection) {
 			selection.destroy();
@@ -2111,7 +2497,12 @@ function undoable({ name, icon, use_loose_canvas_changes, soft, assume_saved }, 
 		window.console?.log(`History node switched during undoable callback for ${name}, from`, before_callback_history_node, "to", current_history_node);
 	}
 
-	const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+	// 2draw: only the changed rectangle is read back when possible (history steps are patches)
+	const image_data = can_capture_incrementally(current_history_node) ? INCREMENTAL : main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+	if (window.P95.debug) {
+		window.P95.debug_captures ??= { incremental: 0, full: 0 };
+		window.P95.debug_captures[image_data === INCREMENTAL ? "incremental" : "full"]++;
+	}
 
 	redos.length = 0;
 	undos.push(current_history_node);
@@ -2138,10 +2529,13 @@ function undoable({ name, icon, use_loose_canvas_changes, soft, assume_saved }, 
 	});
 	current_history_node.futures.push(new_history_node);
 	current_history_node = new_history_node;
+	debug_history_snapshot(new_history_node);
 
-	// 2draw: bound the memory of the history (each step is a full snapshot of the canvas). Deterministic, so
-	// replay and the history restore do the same. (P95 ENGINE_BEHAVIOR 3)
-	if (window.P95.behavior >= 3) {
+	// 2draw: bound the memory of the history. Deterministic, so replay and the history restore do the same.
+	// ENGINE_BEHAVIOR 4: by the bytes the steps hold (patches); 3: by step count, as if each were a full snapshot.
+	if (window.P95.behavior >= 4) {
+		trim_history_by_memory();
+	} else if (window.P95.behavior >= 3) {
 		const keep = window.P95.history_keep_for(main_canvas.width, main_canvas.height);
 		if (history_nodes_by_id.size > 2 * keep) {
 			window.P95.prune_history(keep);
@@ -2159,7 +2553,12 @@ function undoable({ name, icon, use_loose_canvas_changes, soft, assume_saved }, 
 function make_or_update_undoable(undoable_meta, undoable_action) {
 	if (current_history_node.futures.length === 0 && undoable_meta.match(current_history_node)) {
 		undoable_action();
-		current_history_node.image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+		if (can_capture_incrementally(current_history_node)) {
+			update_history_image_incrementally(current_history_node);
+		} else {
+			current_history_node.image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+		}
+		debug_history_snapshot(current_history_node);
 		current_history_node.selection_image_data = selection && selection.canvas.ctx.getImageData(0, 0, selection.canvas.width, selection.canvas.height);
 		current_history_node.selection_x = selection && selection.x;
 		current_history_node.selection_y = selection && selection.y;
@@ -4296,6 +4695,7 @@ window.P95.prune_history = (keep) => {
 	if (chain.length > keep + 1) {
 		const new_root = chain[chain.length - keep - 1];
 		new_root.parent = null;
+		new_root.patch = null; // (was relative to the removed parent)
 		root_history_node = new_root;
 	}
 	const kept = new Set();
@@ -4348,6 +4748,64 @@ window.P95.snap_to_picture = (image_data) => {
  * @param {number} height
  */
 window.P95.history_keep_for = (width, height) => Math.max(10, Math.min(100, Math.floor(128 * 1024 * 1024 / (width * height * 4))));
+/** ENGINE_BEHAVIOR 4: history memory budget (patches and floating selections), and the minimum steps kept */
+const HISTORY_BUDGET_BYTES = 96 * 1024 * 1024;
+const HISTORY_MIN_STEPS = 10;
+/**
+ * Once the history holds more than the budget, keep only the most recent steps (of the current state's ancestry,
+ * and everything after them) that fit in half of it.
+ */
+function trim_history_by_memory() {
+	let total = 0;
+	for (const node of history_nodes_by_id.values()) {
+		total += history_node_bytes(node);
+	}
+	if (total <= HISTORY_BUDGET_BYTES) {
+		return;
+	}
+	// First drop branches abandoned by undoing and then doing something else (kept for Edit > History),
+	// then the oldest steps.
+	const chain = new Set();
+	for (let node = current_history_node; node; node = node.parent) {
+		chain.add(node);
+	}
+	const dropped = [];
+	for (const node of chain) {
+		if (node === current_history_node) continue;
+		for (const child of node.futures) {
+			if (!chain.has(child)) dropped.push(child);
+		}
+		node.futures = node.futures.filter((child) => chain.has(child));
+	}
+	while (dropped.length) {
+		const node = dropped.pop();
+		history_nodes_by_id.delete(node.id);
+		total -= history_node_bytes(node);
+		dropped.push(...node.futures);
+	}
+	if (total <= HISTORY_BUDGET_BYTES) {
+		$G.triggerHandler("history-update");
+		return;
+	}
+	let keep = 0;
+	let bytes = 0;
+	for (let node = current_history_node; node && node.parent; node = node.parent) {
+		bytes += history_node_bytes(node);
+		if (bytes > HISTORY_BUDGET_BYTES / 2 && keep >= HISTORY_MIN_STEPS) {
+			break;
+		}
+		keep++;
+	}
+	window.P95.prune_history(keep);
+}
+/** History size, for benchmarks and the memory rule: steps, and bytes of pixel data held for them */
+window.P95.history_stats = () => {
+	let bytes = 0;
+	for (const node of history_nodes_by_id.values()) {
+		bytes += history_node_bytes(node);
+	}
+	return { steps: history_nodes_by_id.size, bytes };
+};
 /** For the history restore's memory budget */
 window.P95.history_size = () => history_nodes_by_id.size;
 window.P95.reset_history_keeping_canvas = () => {
@@ -4355,6 +4813,7 @@ window.P95.reset_history_keeping_canvas = () => {
 	redos.length = 0;
 	history_node_counter = 0;
 	history_nodes_by_id.clear();
+	history_anchor = null;
 	current_history_node = root_history_node = make_history_node({
 		name: localize("New"),
 		icon: get_help_folder_icon("p_blank.png"),
@@ -4363,3 +4822,5 @@ window.P95.reset_history_keeping_canvas = () => {
 	history_node_to_cancel_to = null;
 	$G.triggerHandler("history-update");
 };
+
+export { install_history_dirty_tracking };

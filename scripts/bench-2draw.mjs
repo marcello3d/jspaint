@@ -13,6 +13,7 @@ import http from "node:http";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 
 const repo_root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const arg = (name, fallback) => {
@@ -64,7 +65,14 @@ function serve(root) {
 				res.end();
 				return;
 			}
-			res.writeHead(200, { "content-type": types[path.extname(file).toLowerCase()] || "application/octet-stream" });
+			const type = types[path.extname(file).toLowerCase()] || "application/octet-stream";
+			// compress text like the CDN does, so load-time numbers are realistic
+			if (/text|javascript|json|svg/.test(type) && /gzip/.test(req.headers["accept-encoding"] || "")) {
+				res.writeHead(200, { "content-type": type, "content-encoding": "gzip" });
+				res.end(zlib.gzipSync(data));
+				return;
+			}
+			res.writeHead(200, { "content-type": type });
 			res.end(data);
 		});
 	});
@@ -288,6 +296,92 @@ async function bench_editor(width, height) {
 	await page.close();
 }
 
+// --- history: undo/redo, memory per step, steps kept ---------------------------------
+async function bench_history(width, height) {
+	const { page } = await new_page();
+	await page.goto(`${base}/index.html?w=${width}&h=${height}`);
+	for (let i = 0; i < 300 && !(await page.evaluate(() => !!(window.P95 && window.P95.recorder)).catch(() => false)); i++) await page.waitForTimeout(20);
+	const out = await page.evaluate(async ({ width, height }) => {
+		document.querySelector('.tools-component .tool[title="Brush"]').click();
+		const rect = main_canvas.getBoundingClientRect();
+		const sx = rect.width / main_canvas.width;
+		const ev = (type, x, y, buttons) => new PointerEvent(type, { bubbles: true, cancelable: true, pointerId: 1, pointerType: "mouse", isPrimary: true, button: type === "pointermove" ? -1 : 0, buttons, clientX: rect.left + (x + 0.5) * sx, clientY: rect.top + (y + 0.5) * sx });
+		const stroke = (i) => {
+			const x0 = 20 + (i * 37) % (width - 80);
+			const y0 = 20 + (i * 53) % (height - 60);
+			main_canvas.dispatchEvent(ev("pointerdown", x0, y0, 1));
+			for (let k = 1; k <= 8; k++) window.dispatchEvent(ev("pointermove", x0 + k * 6, y0 + (k % 3) * 5, 1));
+			const t = performance.now();
+			window.dispatchEvent(ev("pointerup", x0 + 48, y0 + 5, 0));
+			return performance.now() - t;
+		};
+		const ups = [];
+		for (let i = 0; i < 30; i++) ups.push(stroke(i));
+		const stats = window.P95.history_stats();
+		const time = (fn) => { const t = performance.now(); fn(); return performance.now() - t; };
+		const undo_times = [];
+		const redo_times = [];
+		for (let i = 0; i < 10; i++) undo_times.push(time(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }))));
+		for (let i = 0; i < 10; i++) redo_times.push(time(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "y", ctrlKey: true, bubbles: true }))));
+		// steps kept: keep drawing until the history stops growing
+		let max_steps = 0;
+		for (let i = 30; i < 1500; i++) {
+			stroke(i);
+			const steps = window.P95.history_stats().steps;
+			max_steps = Math.max(max_steps, steps);
+			if (i > 400 && steps < max_steps) break;
+		}
+		const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+		return {
+			up: avg(ups), undo: avg(undo_times), redo: avg(redo_times),
+			bytes_per_step: stats.bytes / stats.steps, max_steps,
+			heap: performance.memory ? performance.memory.usedJSHeapSize / 1e6 : 0,
+		};
+	}, { width, height });
+	await page.close();
+	record(`history ${width}x${height}: brush stroke pointerup (ms)`, out.up);
+	record(`history ${width}x${height}: undo / redo (ms)`, `${out.undo.toFixed(2)} / ${out.redo.toFixed(2)}`);
+	record(`history ${width}x${height}: memory per step (KB)`, out.bytes_per_step / 1024);
+	record(`history ${width}x${height}: steps kept (max)`, out.max_steps);
+	record(`history ${width}x${height}: JS heap after (MB)`, out.heap);
+}
+
+// --- load time under a slow network ----------------------------------------------------
+async function bench_load() {
+	const conditions = { offline: false, latency: 150, downloadThroughput: 1.5e6 / 8, uploadThroughput: 0.75e6 / 8 };
+	{
+		const { page, cdp } = await new_page();
+		await cdp.send("Network.enable");
+		await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
+		await cdp.send("Network.emulateNetworkConditions", conditions);
+		let requests = 0;
+		let bytes = 0;
+		page.on("requestfinished", async (r) => { requests++; try { bytes += (await r.sizes()).responseBodySize; } catch { /* */ } });
+		const t0 = Date.now();
+		await page.goto(`${base}/index.html?w=600&h=450`);
+		for (let i = 0; i < 3000 && !(await page.evaluate(() => !!(window.P95 && window.P95.recorder)).catch(() => false)); i++) await page.waitForTimeout(20);
+		record("load (150 ms RTT, 1.5 Mbps): editor to interactive (ms)", Date.now() - t0);
+		record("load: editor requests / KB transferred", `${requests} / ${(bytes / 1024).toFixed(0)}`);
+		await page.close();
+	}
+	{
+		const { page, cdp } = await new_page();
+		await cdp.send("Network.enable");
+		await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
+		await cdp.send("Network.emulateNetworkConditions", conditions);
+		await page.goto(`${base}/__bench_player.html`, { waitUntil: "load" });
+		const ms = await page.evaluate(async () => {
+			const name = Object.keys({ typical: 1 })[0];
+			const player = new window.Paint95Player({ domRoot: document.getElementById("root"), lsaUrl: `__bench_${name}.p95`, fit: "contain" });
+			await player.ready;
+			await new Promise((resolve) => requestAnimationFrame(resolve));
+			return performance.now() - window.__t0;
+		});
+		record("load (150 ms RTT, 1.5 Mbps): player first frame (ms)", ms);
+		await page.close();
+	}
+}
+
 // --- history restore ----------------------------------------------------------
 async function bench_restore(name, bytes, width, height, reps = 1) {
 	const { page } = await new_page();
@@ -337,6 +431,13 @@ try {
 	if (want("editor")) {
 		await bench_editor(600, 450);
 		await bench_editor(1200, 900);
+	}
+	if (want("history")) {
+		await bench_history(600, 450);
+		await bench_history(1200, 900);
+	}
+	if (want("load")) {
+		await bench_load();
 	}
 	if (want("restore")) {
 		for (const [name, bytes] of Object.entries(logs)) await bench_restore(name, bytes);

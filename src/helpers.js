@@ -204,6 +204,178 @@ function image_data_match(a, b, threshold) {
  * @overload
  * @returns {PixelCanvas}  a new canvas element, augmented with `ctx` property, which is also augmented
  */
+// #region Canvas content bounds (2draw)
+// Every canvas made by make_canvas keeps a conservative bounding box of where it may have non-transparent pixels
+// (`canvas.content_bounds`, or null when empty), updated by its drawing calls. So when one canvas is drawn onto
+// another (a tool's mask onto the picture), the destination knows which rectangle can have changed. The main canvas
+// uses this to know the rectangle changed since the last history step (`canvas.on_draw`), so history steps read back
+// only that rectangle instead of the whole canvas.
+
+/** @typedef {{ x0: number, y0: number, x1: number, y1: number }} Bounds */
+
+/** Composite operations that only affect pixels where the canvas already has content (so its bounds can't grow) */
+const CONTAINED_COMPOSITE_OPERATIONS = new Set(["source-in", "destination-in", "source-atop"]);
+/** Composite operations that only affect pixels inside what's drawn */
+const LOCAL_COMPOSITE_OPERATIONS = new Set([
+	"source-over", "source-atop", "destination-over", "destination-out", "lighter", "xor", "multiply", "screen", "overlay",
+	"darken", "lighten", "color-dodge", "color-burn", "hard-light", "soft-light", "difference", "exclusion", "hue",
+	"saturation", "color", "luminosity",
+]);
+
+/**
+ * @param {HTMLCanvasElement} canvas
+ * @param {CanvasRenderingContext2D} ctx
+ */
+function track_canvas_bounds(canvas, ctx) {
+	/** @type {Bounds | null} */
+	let bounds = null;
+	Object.defineProperty(canvas, "content_bounds", { configurable: true, get: () => bounds });
+	const all = () => ({ x0: 0, y0: 0, x1: canvas.width, y1: canvas.height });
+	/**
+	 * @param {Bounds | null} b - null: unknown, anywhere
+	 * @param {boolean} [adds_content] - false for clearing (changes pixels, but adds no content)
+	 */
+	const touched = (b, adds_content = true) => {
+		const rect = b ? {
+			x0: Math.max(0, Math.floor(b.x0) - 1),
+			y0: Math.max(0, Math.floor(b.y0) - 1),
+			x1: Math.min(canvas.width, Math.ceil(b.x1) + 1),
+			y1: Math.min(canvas.height, Math.ceil(b.y1) + 1),
+		} : all();
+		if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0) {
+			return;
+		}
+		if (!adds_content) {
+			canvas.on_draw?.(b ? rect : null);
+			return;
+		}
+		bounds = bounds ? {
+			x0: Math.min(bounds.x0, rect.x0), y0: Math.min(bounds.y0, rect.y0),
+			x1: Math.max(bounds.x1, rect.x1), y1: Math.max(bounds.y1, rect.y1),
+		} : rect;
+		canvas.on_draw?.(b ? rect : null);
+	};
+	for (const dim of ["width", "height"]) {
+		const descriptor = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, dim);
+		Object.defineProperty(canvas, dim, {
+			configurable: true,
+			enumerable: true,
+			get() { return descriptor.get.call(this); },
+			set(value) {
+				descriptor.set.call(this, value);
+				bounds = null; // cleared
+				canvas.on_draw?.(null); // (everything changed)
+			},
+		});
+	}
+	/** For a drawing call: true if handled because it can only change pixels inside the existing content */
+	const contained = () => {
+		if (!CONTAINED_COMPOSITE_OPERATIONS.has(ctx.globalCompositeOperation)) return false;
+		if (bounds) canvas.on_draw?.(bounds);
+		return true;
+	};
+	/** the translation of the current transform, or null if it scales/rotates */
+	const translation = () => {
+		const m = ctx.getTransform();
+		return (m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1) ? m : null;
+	};
+	const rect_op = (name, { composite = true, pad = () => 0 } = {}) => {
+		const original = ctx[name];
+		ctx[name] = function (x, y, w, h) {
+			if (composite && contained()) {
+				return original.apply(this, arguments);
+			}
+			const t = translation();
+			if (!t || (composite && !LOCAL_COMPOSITE_OPERATIONS.has(ctx.globalCompositeOperation))) {
+				touched(null);
+			} else {
+				const p = pad();
+				const x0 = Math.min(x, x + w) + t.e - p;
+				const y0 = Math.min(y, y + h) + t.f - p;
+				touched({ x0, y0, x1: x0 + Math.abs(w) + 2 * p, y1: y0 + Math.abs(h) + 2 * p });
+			}
+			return original.apply(this, arguments);
+		};
+	};
+	rect_op("fillRect");
+	rect_op("strokeRect", { pad: () => ctx.lineWidth / 2 + 1 });
+	// clearing changes pixels but never adds content; clearing everything empties the canvas
+	const original_clear_rect = ctx.clearRect;
+	ctx.clearRect = function (x, y, w, h) {
+		const t = translation();
+		if (!t) {
+			canvas.on_draw?.(null);
+		} else {
+			const x0 = Math.min(x, x + w) + t.e;
+			const y0 = Math.min(y, y + h) + t.f;
+			const x1 = x0 + Math.abs(w);
+			const y1 = y0 + Math.abs(h);
+			touched({ x0, y0, x1, y1 }, false);
+			if (x0 <= 0 && y0 <= 0 && x1 >= canvas.width && y1 >= canvas.height) {
+				bounds = null;
+			}
+		}
+		return original_clear_rect.apply(this, arguments);
+	};
+	for (const name of ["fill", "stroke", "fillText", "strokeText"]) {
+		const original = ctx[name];
+		ctx[name] = function () {
+			if (!contained()) {
+				touched(null);
+			}
+			return original.apply(this, arguments);
+		};
+	}
+	const original_draw_image = ctx.drawImage;
+	ctx.drawImage = function (image, ...args) {
+		if (contained()) {
+			return original_draw_image.apply(this, arguments);
+		}
+		const t = translation();
+		if (!t || !LOCAL_COMPOSITE_OPERATIONS.has(ctx.globalCompositeOperation)) {
+			touched(null);
+			return original_draw_image.apply(this, arguments);
+		}
+		const iw = image.naturalWidth || image.videoWidth || image.width;
+		const ih = image.naturalHeight || image.videoHeight || image.height;
+		let sx = 0, sy = 0, sw = iw, sh = ih, dx, dy, dw, dh;
+		if (args.length === 2) {
+			[dx, dy] = args;
+			dw = iw;
+			dh = ih;
+		} else if (args.length === 4) {
+			[dx, dy, dw, dh] = args;
+		} else {
+			[sx, sy, sw, sh, dx, dy, dw, dh] = args;
+		}
+		const source_bounds = image.content_bounds;
+		if (image.content_bounds !== undefined && source_bounds === null) {
+			// an empty canvas: nothing drawn (with a local composite operation)
+			return original_draw_image.apply(this, arguments);
+		}
+		if (source_bounds && dw === sw && dh === sh) {
+			// only where the source has content
+			touched({
+				x0: Math.max(source_bounds.x0, sx) - sx + dx + t.e,
+				y0: Math.max(source_bounds.y0, sy) - sy + dy + t.f,
+				x1: Math.min(source_bounds.x1, sx + sw) - sx + dx + t.e,
+				y1: Math.min(source_bounds.y1, sy + sh) - sy + dy + t.f,
+			});
+		} else {
+			touched({ x0: Math.min(dx, dx + dw) + t.e, y0: Math.min(dy, dy + dh) + t.f, x1: Math.max(dx, dx + dw) + t.e, y1: Math.max(dy, dy + dh) + t.f });
+		}
+		return original_draw_image.apply(this, arguments);
+	};
+	const original_put_image_data = ctx.putImageData;
+	ctx.putImageData = function (image_data, dx, dy, dirty_x = 0, dirty_y = 0, dirty_w = image_data.width, dirty_h = image_data.height) {
+		// (putImageData ignores the transform and the composite operation)
+		touched({ x0: dx + dirty_x, y0: dy + dirty_y, x1: dx + dirty_x + dirty_w, y1: dy + dirty_y + dirty_h });
+		return original_put_image_data.apply(this, arguments);
+	};
+}
+
+// #endregion
+
 function make_canvas(width, height) {
 	const image = width;
 
@@ -256,6 +428,8 @@ function make_canvas(width, height) {
 			new_ctx.drawImage(image, 0, 0);
 		}
 	};
+
+	track_canvas_bounds(new_canvas, new_ctx);
 
 	if (width && height) {
 		// make_canvas(width, height)
