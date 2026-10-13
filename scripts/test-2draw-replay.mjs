@@ -17,7 +17,7 @@ import zlib from "node:zlib";
 
 const repo_root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const use_dist = process.argv.includes("--dist");
-const app_root = use_dist ? path.join(repo_root, "dist-2draw") : repo_root;
+const app_root = process.env.P95_APP_ROOT ? path.resolve(process.env.P95_APP_ROOT) : use_dist ? path.join(repo_root, "dist-2draw") : repo_root;
 const verbose = process.argv.includes("--verbose");
 
 async function load_playwright() {
@@ -217,13 +217,13 @@ async function record_session(page, { width, height, script }) {
 /**
  * Replays with player.js in a same-origin host page; returns the final pixels.
  */
-async function replay_session(page, recording, { seek_back = false } = {}) {
+async function replay_session(page, recording, { seek_back = false, final_image_url = null } = {}) {
 	await page.route(`${base}/__test_host.html`, (route) => route.fulfill({
 		contentType: "text/html",
 		body: `<!doctype html><meta charset="utf-8"><body style="margin:0"><div id="root" style="width:400px;height:300px"></div><script src="player.js"></script>`,
 	}));
 	await page.goto(`${base}/__test_host.html`, { waitUntil: "load" });
-	return page.evaluate(async ({ base64, seek_back }) => {
+	return page.evaluate(async ({ base64, seek_back, final_image_url }) => {
 		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
 		const url = URL.createObjectURL(new Blob([bytes]));
 		const drifts = [];
@@ -231,6 +231,7 @@ async function replay_session(page, recording, { seek_back = false } = {}) {
 		const player = new window.Paint95Player({
 			domRoot: document.getElementById("root"),
 			lsaUrl: url,
+			finalImageUrl: final_image_url,
 			controls: true,
 			fit: "contain",
 			onDrift: (drift) => drifts.push(drift),
@@ -267,7 +268,7 @@ async function replay_session(page, recording, { seek_back = false } = {}) {
 			height: image_data.height,
 			pixels: Array.from(image_data.data),
 		};
-	}, { base64: recording.base64, seek_back });
+	}, { base64: recording.base64, seek_back, final_image_url });
 }
 
 function compare(label, recording, replay) {
@@ -906,6 +907,68 @@ async function test_no_font_permission(recording_with_text) {
 	check(replay.ended && calls === 0, `fonts: playing a recording with text doesn't call queryLocalFonts (${calls} calls)`);
 }
 
+/** Recordings made with ENGINE_BEHAVIOR 1 (transforms stored as pixels, v1 container) still replay exactly. */
+async function test_behavior1_fixtures() {
+	for (const name of ["image_menu-behavior1-v1", "all_tools-behavior1-v1"]) {
+		const base64 = fs.readFileSync(path.join(repo_root, "scripts", "fixtures", `${name}.p95`)).toString("base64");
+		const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+		watch(page, name);
+		const replay = await replay_session(page, { base64 });
+		await page.close();
+		check(replay.ended && replay.drifts.length === 0, `behavior1: ${name} replays without drift (${JSON.stringify(replay.drifts).slice(0, 200)})`);
+	}
+}
+
+/**
+ * Pictures by reference: a revision without a usable recording stores the starting picture's URL (and hash),
+ * and the player fetches it; with a drifting replay, the player snaps to finalImageUrl at the end.
+ */
+async function test_references() {
+	const width = 200;
+	const height = 150;
+	const start_png = make_test_png(); // 24x16, drawn at the top left of a white 200x150 canvas
+	const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(editor, "references/editor");
+	const start_url = `${base}/data/1/77/77-v1.png`;
+	await editor.route((url) => url.pathname.endsWith("/data/1/77/77-v1.png"), (route) => route.fulfill({ contentType: "image/png", body: start_png }));
+	await editor.goto(`${base}/index.html?w=${width}&h=${height}&load=${encodeURIComponent(start_url)}`, { waitUntil: "networkidle" });
+	for (let i = 0; i < 100 && !(await editor.evaluate(() => !!(window.P95 && window.P95.recorder))); i++) await editor.waitForTimeout(100);
+	const box = await (await editor.$(".main-canvas")).boundingBox();
+	await editor.click(`.tools-component .tool[title="Brush"]`);
+	await editor.mouse.move(box.x + 30, box.y + 30);
+	await editor.mouse.down();
+	for (let i = 0; i < 12; i++) await editor.mouse.move(box.x + 30 + i * 10, box.y + 30 + i * 6);
+	await editor.mouse.up();
+	const recording = await editor.evaluate(async () => {
+		const bytes = new Uint8Array(await window.P95.recorder.finalize().arrayBuffer());
+		let binary = "";
+		for (const byte of bytes) binary += String.fromCharCode(byte);
+		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+		return { base64: btoa(binary), size: bytes.length, start: window.P95.recorder.segment.start, width: image_data.width, height: image_data.height, pixels: Array.from(image_data.data), png_base64: main_canvas.toDataURL("image/png").split(",")[1] };
+	});
+	await editor.close();
+	check(recording.start.type === "image" && recording.start.url === start_url && typeof recording.start.hash === "number" && recording.start.blob === undefined,
+		`references: the starting picture is stored by URL (${JSON.stringify(recording.start)}); file ${recording.size} bytes`);
+
+	// replay: fetches the starting picture
+	let page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "references/player");
+	await page.route((url) => url.pathname.endsWith("/data/1/77/77-v1.png"), (route) => route.fulfill({ contentType: "image/png", body: start_png }));
+	let replay = await replay_session(page, recording);
+	await page.close();
+	compare("references: replay with the starting picture by URL", recording, replay);
+
+	// starting picture unavailable, with the final picture from the page: drift, then the end snaps to it
+	page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "references/player-missing");
+	await page.route((url) => url.pathname.endsWith("/__final.png"), (route) => route.fulfill({ contentType: "image/png", body: Buffer.from(recording.png_base64, "base64") }));
+	replay = await replay_session(page, recording, { final_image_url: `${base}/__final.png` });
+	await page.close();
+	check(replay.drifts.length > 0, `references: a missing starting picture is reported as drift (${replay.drifts.map((d) => d.type)})`);
+	const same = replay.pixels.length === recording.pixels.length && replay.pixels.every((v, i) => v === recording.pixels[i]);
+	check(same, "references: after drifting, the end shows the final picture from finalImageUrl");
+}
+
 const recordings = {};
 
 try {
@@ -923,6 +986,9 @@ try {
 		await player_page.close();
 		compare(name, recording, replay);
 		recordings[name] = recording;
+		if (name === "image_menu") {
+			check(!recording.counts.b && !recording.counts.p, `image_menu: rotate/stretch/skew store no pixels, and there are no picture keyframes (${JSON.stringify(recording.counts)})`);
+		}
 		if (name === "all_tools" || name === "typical") {
 			await measure_restore(name, recording, 320, 240);
 		}
@@ -941,6 +1007,12 @@ try {
 	}
 	if (wanted("fonts")) {
 		await test_no_font_permission(recordings.all_tools);
+	}
+	if (wanted("behavior1")) {
+		await test_behavior1_fixtures();
+	}
+	if (wanted("references")) {
+		await test_references();
 	}
 	if (wanted("format")) {
 		await test_format_v1_v2(recordings);

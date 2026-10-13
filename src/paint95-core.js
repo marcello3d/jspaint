@@ -13,8 +13,10 @@
 	/**
 	 * Bump this whenever recorded input would replay differently (and keep the old behavior reachable via P95.behavior).
 	 * 1: initial (software polygon rasterizer instead of WebGL, seeded airbrush, text/transform snapshots)
+	 * 2: rotate and stretch/skew are software nearest-neighbor (no stored pixels); behavior-1 recordings still
+	 *    replay the old way, using their stored pixels
 	 */
-	const ENGINE_BEHAVIOR = 1;
+	const ENGINE_BEHAVIOR = 2;
 
 	/** mulberry32 */
 	function make_prng(seed) {

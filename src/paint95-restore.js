@@ -65,6 +65,7 @@ export async function restore_history(file, { width, height, expected_hash }) {
 	try {
 		controller.load_file(file);
 		controller.ondrift = (details) => { drift = drift || details; };
+		await controller.prepare(); // starting pictures stored by URL
 		while (!controller.done) {
 			await new Promise((resolve) => requestAnimationFrame(() => resolve()));
 			controller.advance_to(Infinity, 12);

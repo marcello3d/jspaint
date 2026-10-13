@@ -16,7 +16,7 @@
 import { change_url_param, deselect, set_magnification, show_error_message } from "./functions.js";
 import { $G, E, make_canvas } from "./helpers.js";
 import { showMessageBox } from "./msgbox.js";
-import { fetch_cors, load_image_cors } from "./paint95-fetch.js";
+import { fetch_cors, is_reference_url, load_image_cors } from "./paint95-fetch.js";
 import { decode_p95, hash_image_data } from "./paint95-format.js";
 import { restore_history } from "./paint95-restore.js";
 import { Recorder } from "./paint95-record.js";
@@ -273,7 +273,9 @@ function init_editor() {
 		}
 		try {
 			recorder = new Recorder({ previous });
-			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank", history_keep });
+			// An immutable versioned 2draw picture (…/data/13/132726/132726-v1.png) is stored by reference.
+			const reference_url = loaded && is_reference_url(window.paint95_load_url) ? window.paint95_load_url : null;
+			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank", history_keep, url: reference_url });
 		} catch (error) {
 			console.error("Failed to start recording", error);
 			recorder = null;

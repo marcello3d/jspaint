@@ -8,7 +8,6 @@ import { FORMAT_VERSION, encode_p95, encode_png, hash_image_data } from "./paint
 import { tools } from "./tools.js";
 
 const HASH_EVERY_EVENTS = 300;
-const KEYFRAME_EVERY_MS = 2 * 60 * 1000;
 const MAX_EVENTS = 500000;
 const MAX_RAW_BYTES = 40 * 1024 * 1024;
 export const MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -86,7 +85,6 @@ export class Recorder {
 		this.stopped = false;
 		this.raw_bytes = 0;
 		this.events_since_hash = 0;
-		this.last_keyframe_t = 0;
 		/** @type {({ png: Uint8Array } | { image_data: ImageData })[]} */
 		this.blobs = [];
 		/** @type {Record<string, string>} */
@@ -127,13 +125,20 @@ export class Recorder {
 	 * @param {"blank" | "image" | "continue"} options.start
 	 * @param {number | null} [options.history_keep] - for "continue": the previous sessions' undo history was restored
 	 *   (and pruned to this many steps), see paint95-restore.js
+	 * @param {string | null} [options.url] - the starting picture's URL, if it's an immutable 2draw picture: stored by
+	 *   reference (with its hash) instead of embedding it
 	 */
-	begin({ start, history_keep = null }) {
+	begin({ start, history_keep = null, url = null }) {
 		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-		if (start === "image") {
+		if (start === "image" && url) {
+			this.segment.start = { type: "image", url, hash: hash_image_data(image_data) };
+		} else if (start === "image") {
 			this.segment.start = { type: "image", blob: this.add_blob(image_data) };
 		} else if (start === "continue") {
 			this.segment.start = { type: "continue", hash: hash_image_data(image_data) };
+			if (url) {
+				this.segment.start.url = url;
+			}
 			if (history_keep != null) {
 				Object.assign(this.segment.start, { history: true, keep: history_keep });
 			}
@@ -200,12 +205,8 @@ export class Recorder {
 			const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 			this.push(t, "h", hash_image_data(image_data), image_data.width, image_data.height);
 		} else if (this.active_pointers.size === 0 && !this.stopped) {
-			if (t - this.last_keyframe_t >= KEYFRAME_EVERY_MS) {
-				const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-				this.push(t, "p", this.add_blob(image_data), hash_image_data(image_data), image_data.width, image_data.height);
-				this.last_keyframe_t = t;
-				this.events_since_hash = 0;
-			} else if (this.events_since_hash >= HASH_EVERY_EVENTS) {
+			// (hashes only, no picture keyframes: on drift the player snaps to the final picture)
+			if (this.events_since_hash >= HASH_EVERY_EVENTS) {
 				const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 				this.push(t, "h", hash_image_data(image_data), image_data.width, image_data.height);
 				this.events_since_hash = 0;
@@ -417,12 +418,13 @@ export class Recorder {
 	finalize() {
 		try {
 			const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-			const blobs = [...this.blobs, { image_data }];
+			const blobs = this.blobs;
 			const segment = {
 				...this.segment,
 				events: this.segment.events.slice(),
 				duration: Math.max(this.last_t, Math.round(this.now())),
-				end: { hash: hash_image_data(image_data), width: image_data.width, height: image_data.height, blob: blobs.length - 1 },
+				// (no picture: the player gets the final picture from the page, see player.js finalImageUrl)
+				end: { hash: hash_image_data(image_data), width: image_data.width, height: image_data.height },
 			};
 			const segments = [...this.previous_segments.map((s) => ({ ...s, events: s.events.slice() })), segment];
 			const make_file = (/** @type {any[]} */ segs, truncated) => {

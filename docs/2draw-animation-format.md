@@ -5,20 +5,27 @@ the input back into the same engine. This file is what 2draw stores as `<entry>-
 
 ## Container
 
-All integers little-endian.
+Container integers are little-endian (u32 LE).
 
 | Offset | Size | Contents |
 | --- | --- | --- |
 | 0 | 4 | magic `P95A` (ASCII) |
-| 4 | 1 | container version (`1`) |
+| 4 | 1 | container version: `2` (written now), `1` (still read) |
 | 5 | 3 | reserved (0) |
 | 8 | 4 | `J` = byte length of the compressed header |
 | 12 | `J` | header: UTF-8 JSON, zlib-compressed (pako `deflate`) |
-| 12+`J` | 4 | `N` = number of blobs |
-| … | | `N` × (u32 length, bytes): blobs, referenced by index from the header. Every blob is a PNG. |
+| | | **v2 only:** per segment, in order: u32 length + event payload (see [Events (v2 binary)](#events-v2-binary)) |
+| … | 4 | `N` = number of blobs |
+| … | | `N` × (u32 length, bytes): blobs, referenced by index. Every blob is a PNG. |
+
+In v1 each segment's `events` is a JSON array inside the header; in v2 it's `null` there (with `event_count`), and the
+events follow the header in binary. Decoding either gives the same in-memory events (the JSON arrays described below), so
+the engine, player and history restore don't care which version a file is. Recording writes v2; continuing a v1 file
+converts its segments losslessly.
 
 PNGs are encoded and decoded byte-exactly (UPNG.js, RGBA, no premultiplication or color management), so their pixels
-can be compared and restored exactly.
+can be compared and restored exactly. Since ENGINE_BEHAVIOR 2 the only blobs are pasted/dropped images and text-commit
+snapshots (v1 files may also have embedded starting pictures, rotate/stretch results, picture keyframes and final pictures).
 
 ## Header
 
@@ -40,16 +47,19 @@ can be compared and restored exactly.
   engine: { sha, behavior },      // git SHA of the build that recorded it, and ENGINE_BEHAVIOR (integer)
   width, height,                  // canvas size the session was required to submit
   start: { type: "blank" }        // white width×height canvas
-       | { type: "image", blob }  // the starting picture (e.g. the `load` image), exact pixels
-       | { type: "continue", hash }, // continue from the previous segment's result, cropped/padded onto
-                                  //   white width×height (as it was submitted); hash = expected start pixels
+       | { type: "image", blob }  // the starting picture (e.g. a `load` image that isn't a 2draw picture), exact pixels
+       | { type: "image", url, hash } // the starting picture by reference: an immutable versioned 2draw picture
+                                  //   (…/data/13/132726/132726-v1.png), drawn onto white width×height; hash = of that
+       | { type: "continue", hash, url? }, // continue from the previous segment's result, cropped/padded onto
+                                  //   white width×height (as it was submitted); hash = expected start pixels;
+                                  //   url = that picture (the previous version's PNG), used if the replay drifted
        | { type: "continue", hash, history: true, keep }, // the editor restored the previous sessions' undo
                                   //   history (see below) and continued from that exact state, after keeping only
                                   //   the last `keep` undo steps (P95.prune_history)
   events: [Event, ...],
   duration,                       // ms of recording
   truncated?: true,               // events stop early (size cap); the end picture still exists
-  end: { hash, width, height, blob }, // the final canvas (exact PNG) and its hash
+  end: { hash, width, height },   // hash of the final canvas (v1 files also have `blob`: the final picture as PNG)
 }
 ```
 
@@ -77,12 +87,51 @@ matter).
 | `s` | `{changes}` | tool state changes: `bs` brush shape, `b` brush size, `e` eraser size, `a` airbrush size, `p` pencil size, `w` line width, `tm` transparent selection mode, `fg`/`bg`/`tc` colors (left/right/ctrl-click), `pal` palette (28 colors), `font` text tool font, `z` zoom, `so` `{toolId: bits}` fill style (1 outline, 2 fill), and in a segment's first event `tools` (selected tool ids) |
 | `t` | `text` | the text tool's box now contains `text` |
 | `f` | `name, ...args` | a command from the menus/keyboard/dialogs, with dialog results as values: `undo`, `redo`, `cancel(going_to_history_node, discard)`, `deselect(going_to_history_node)`, `delete_selection(name)`, `select_all`, `clear`, `invert_colors`, `flip_horizontal`, `flip_vertical`, `rotate(radians)`, `stretch_and_skew(x_scale, y_scale, h_skew, v_skew)`, `paste(blob, x, y)`, `select_tool(toolId, toggle)`, `go_to_history_node(id, canceling)`, `new_document`, `nudge_selection(dx, dy)`, `scale_selection(factor)` |
-| `b` | `kind, blob, ...` | out-of-band pixels for the preceding action: `"text", blob, x, y` (the canvas area under a committed text box: fonts differ between machines) and `"transform", blob` (result of rotate/stretch/skew, whose resampling differs between browsers) |
+| `b` | `kind, blob, ...` | out-of-band pixels for the preceding action: `"text", blob, x, y` (the canvas area under a committed text box: fonts differ between machines); in ENGINE_BEHAVIOR 1 recordings also `"transform", blob` (result of rotate/stretch/skew) |
 | `h` | `hash, width, height` | keyframe: hash of the canvas at this point |
-| `p` | `blob, hash, width, height` | keyframe with the full canvas as a PNG (about every 2 minutes) |
+| `p` | `blob, hash, width, height` | keyframe with the full canvas as a PNG (v1 files only; no longer written) |
 
 Commands are recorded only when they come from the UI. When they happen as a consequence of a recorded pointer event
 (e.g. the pick-color tool switching back to the previous tool), they're reproduced by replaying that event.
+
+### Events (v2 binary)
+
+`src/paint95-events.js`, in the style of Lascaux `.lsa` v3 and the PaintBBS/Shi formats: LEB128 varints, zigzag
+(signed) varints, per-type opcodes, and like numbers in separate streams so deflate finds the patterns.
+
+Event payload: `u8 compression` (0 none, 1 zlib) then the streams:
+`varint stream count, varint length × count, streams…` with streams in this order:
+
+| Stream | Contents |
+| --- | --- |
+| `op` | one opcode byte per event: `d`1 `M`2 `m`3 `u`4 `c`5 `s`6 `k`7 `t`8 `f`9 `b`10 `h`11 `p`12, `0x3f` = JSON escape; pointer opcodes `+0x40` when the pointer id differs from the previous pointer event's |
+| `dt` | zigzag varint `dt` per event |
+| `dx`, `dy` | zigzag varint deltas of x/y from the previous pointer event's position (starting at 0,0), for `d M m u c` |
+| `p` | pressure byte (0–255) for `d` and `M` |
+| `other` | everything else, in event order |
+
+`other` per event type:
+
+- pointer events with `+0x40`: varint pointer id first;
+- `d`: target byte (0 `"c"`, 1 `"a"`, 2 selection + zigzag n, 3 text box + zigzag n), flags byte
+  (`mods` bits 0–3, pointer type bits 4–5, primary bit 6), buttons byte;
+- `M`, `u`: mods byte, buttons byte; `m`, `c`, `k`: nothing;
+- buttons byte = `buttons` (bits 0–4) `| (button + 1) << 5`; `0xff` = escape: zigzag `button`, varint `buttons`;
+- `s`: varint field count, then per field an id byte (`bs b e a p w tm fg bg tc pal font z so tools` = 0–14, 255 + string
+  for an unknown name) and the value: `bs` an enum byte (circle, square, reverse_diagonal, diagonal), colours (below),
+  `pal` a byte 0 = JS Paint's default palette (only in a segment's first `s`) or 1 + varint count + colours, `font`
+  varint count + (key id: family size line_scale bold italic underline vertical color background) + value,
+  `so`/`tools` tool ids as enum bytes (the 16 tools in toolbox order), others a generic value;
+- colour: tag byte 0 null, 1 `""`, 2 + varint palette index (the palette current in the stream), 3 + r g b (`#rrggbb`),
+  4 + r g b (`rgb(r,g,b)`), 5 + string;
+- `t`: string; `f`: command id byte (the command list above, in order; 255 + string) + varint arg count + args
+  (`select_tool` ids as `0x80` + tool enum byte, otherwise generic values); `b`: kind byte + varint blob + varint count +
+  values; `h`: u32 hash (big-endian) + varint width, height; `p`: varint blob + u32 hash + varint width, height;
+- JSON escape: string with the v1 JSON array (anything that doesn't fit its compact form exactly);
+- generic value: tag byte 0 null, 1 false, 2 true, 3 + varint, 4 + varint (negative), 5 + f64 (big-endian), 6 + string,
+  7 array (varint count + values), 8 object (varint count + (string key, value)); strings are varint length + UTF-8.
+
+The enum tables only grow; never reorder them.
 
 ### Hash
 
@@ -102,14 +151,15 @@ Determinism measures in the engine (ENGINE_BEHAVIOR 1):
   without WebGL;
 - the airbrush uses `P95.random()` (seeded) and timer ticks are events;
 - pasted/dropped images are stored as PNG (and the recorder pastes the same normalized pixels the replay will);
-- text and rotate/stretch/skew results are stored as pixels (`b` events);
+- text results are stored as pixels (`b` events); rotate and stretch/skew are software nearest-neighbor (ENGINE_BEHAVIOR 2;
+  in behavior 1 they were canvas transforms, stored as pixels);
 - time-dependent code reads `P95.now()`.
 
 ### Size cap
 
 The recorder stops adding events past 500,000 events or ~40 MB of estimated data (`truncated`). When building the file,
-if it's over **8 MB**, the new session's events are dropped (keeping its start and final picture), then all sessions'
-events; if it's still too big, no animation is submitted. Submitting the drawing never fails because of the animation.
+if it's over **8 MB**, the new session's events are dropped, then all sessions' events (the player then shows the start
+and snaps to the final picture); if it's still too big, no animation is submitted. Submitting the drawing never fails because of the animation.
 
 ## Continuing a drawing
 
@@ -148,5 +198,7 @@ localStorage. `player.js` creates it as a hidden same-origin iframe and drives `
   (a pointer held still counts at most 1 s); pauses before a stroke or a picture-changing command count at most 250 ms;
   events that don't change the picture (`s`, `h`, `p`, `b`, `select_tool`) take no time. Times the speed. Constants at the
   top of `src/paint95-replay.js`. Seeking backwards replays from the start in a fresh iframe;
-- on a hash mismatch the player reports `onDrift` and snaps to the next PNG keyframe or, at the end of a segment, the final
-  picture, and keeps going.
+- pictures by reference (starting pictures, and the final picture passed as `finalImageUrl` by the page) are fetched
+  before playing (with the same cache-busting CORS fetch as the editor) and checked against their hashes;
+- on a hash mismatch the player reports `onDrift` and keeps going; at the end it snaps to the final picture (a v1 file's
+  stored one, or `finalImageUrl`). A missing starting picture means replaying from white.

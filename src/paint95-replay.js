@@ -5,6 +5,7 @@
 
 import { cancel, deselect, get_tool_by_id, render_canvas_view, reset_canvas_and_history, reset_selected_colors, select_tools, set_magnification, update_canvas_rect } from "./functions.js";
 import { $G, make_canvas } from "./helpers.js";
+import { load_picture_image_data } from "./paint95-fetch.js";
 import { decode_p95, decode_png, hash_image_data } from "./paint95-format.js";
 
 // Playback timing (display only; the replayed engine always sees the recorded times).
@@ -51,6 +52,10 @@ export class ReplayController {
 		/** cursor for the player's overlay */
 		this.cursor = { x: 0, y: 0, down: false, visible: false };
 		this.drifted = false;
+		/** @type {Map<number, ImageData>} starting pictures stored by reference (fetched and hash-verified by prepare()) */
+		this.start_images = new Map();
+		/** @type {ImageData | null} the final picture from the page (player.js finalImageUrl), for the end snap */
+		this.final_image = null;
 		/** @type {(drift: any) => void} */
 		this.ondrift = () => { };
 		this.done = false;
@@ -91,6 +96,41 @@ export class ReplayController {
 		this.position = 0;
 		window.P95.player = this;
 		return { duration: this.duration, width: header.width, height: header.height, truncated: header.truncated, segments: header.segments.length };
+	}
+
+	/**
+	 * Fetches what the file refers to instead of embedding: starting pictures stored by URL (verified against their
+	 * hash), and the final picture for the end snap. Never throws; missing pictures are handled during replay.
+	 * @param {object} [options]
+	 * @param {string | null} [options.final_image_url]
+	 */
+	async prepare({ final_image_url = null } = {}) {
+		const segments = this.file.header.segments;
+		const jobs = segments.map(async (segment, seg) => {
+			const { start } = segment;
+			if (!start.url) return;
+			try {
+				const image_data = await load_picture_image_data(start.url, segment.width, segment.height);
+				if (hash_image_data(image_data) === start.hash) {
+					this.start_images.set(seg, image_data);
+				} else {
+					console.warn(`[replay] starting picture ${start.url} doesn't match its hash`);
+				}
+			} catch (error) {
+				console.warn(`[replay] couldn't load the starting picture ${start.url}`, error);
+			}
+		});
+		if (final_image_url) {
+			const last = segments[segments.length - 1];
+			jobs.push((async () => {
+				try {
+					this.final_image = await load_picture_image_data(final_image_url, last.width, last.height);
+				} catch (error) {
+					console.warn(`[replay] couldn't load the final picture ${final_image_url}`, error);
+				}
+			})());
+		}
+		await Promise.all(jobs);
 	}
 
 	/**
@@ -223,8 +263,13 @@ export class ReplayController {
 			const previous = this.file.header.segments[seg - 1];
 			// The editor started from the submitted picture: the previous result cropped/padded onto white.
 			let source = make_canvas(main_canvas);
-			if (previous.end && previous.end.blob != null && hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height)) !== previous.end.hash) {
-				source = make_canvas(this.blob_image_data(previous.end.blob));
+			if (previous.end && hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height)) !== previous.end.hash) {
+				// the previous session drifted: start from the real picture (by reference, or v1's stored final picture)
+				if (this.start_images.has(seg)) {
+					source = make_canvas(this.start_images.get(seg));
+				} else if (previous.end.blob != null) {
+					source = make_canvas(this.blob_image_data(previous.end.blob));
+				}
 			}
 			my_canvas_width = segment.width;
 			my_canvas_height = segment.height;
@@ -245,10 +290,15 @@ export class ReplayController {
 			reset_selected_colors();
 			reset_canvas_and_history();
 			if (segment.start.type === "image") {
-				const image_data = this.blob_image_data(segment.start.blob);
-				main_canvas.width = image_data.width;
-				main_canvas.height = image_data.height;
-				main_ctx.putImageData(image_data, 0, 0);
+				const image_data = segment.start.blob != null ? this.blob_image_data(segment.start.blob) : this.start_images.get(seg);
+				if (image_data) {
+					main_canvas.width = image_data.width;
+					main_canvas.height = image_data.height;
+					main_ctx.putImageData(image_data, 0, 0);
+				} else {
+					// starting picture unavailable: replay from white; the end snaps to the final picture
+					this.drift({ type: "start", segment: seg, message: "starting picture unavailable" });
+				}
 			}
 		}
 		window.P95.reset_history_keeping_canvas();
@@ -265,9 +315,13 @@ export class ReplayController {
 			if (actual !== segment.end.hash && !segment.truncated) {
 				this.drift({ type: "end", time: entry.t, expected: segment.end.hash, actual });
 			}
+			const is_last = segment === this.file.header.segments[this.file.header.segments.length - 1];
 			if (segment.end.blob != null) {
 				deselect(true);
 				this.snap(this.blob_image_data(segment.end.blob));
+			} else if (is_last && this.final_image) {
+				deselect(true);
+				this.snap(this.final_image);
 			}
 		}
 	}

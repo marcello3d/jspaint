@@ -1,7 +1,7 @@
 // JSPaint.exe animation player (classic script; no modules needed by the host page).
 //
-//   new Paint95Player({ domRoot, lsaUrl /* .p95 URL */, width?, height?, autoplay?, speed?, controls?, fit?: "box" | "contain",
-//     onTimeUpdate?, onError?, onEnd?, onDrift? })
+//   new Paint95Player({ domRoot, lsaUrl /* .p95 URL */, finalImageUrl? /* the entry's picture, for the end snap if the
+//     replay drifts */, width?, height?, autoplay?, speed?, controls?, fit?: "box" | "contain", onTimeUpdate?, onError?, onEnd?, onDrift? })
 //   members: ready (Promise), duration (ms), currentTime (ms), isPlaying, play(), pause(), seek(ms), setSpeed(multiplier), destroy()
 //
 // It replays the recorded input in the same engine: a hidden same-origin iframe of index.html?replay=1
@@ -122,7 +122,12 @@
 						throw new Error("Replay engine failed to start");
 					}
 					var info = controller.load(self._buffer.slice(0));
-					resolve({ iframe: iframe, controller: controller, info: info });
+					// fetch the pictures the file refers to (starting picture by URL; the final picture for the end snap)
+					controller.prepare({ final_image_url: self._options.finalImageUrl || null }).then(function () {
+						resolve({ iframe: iframe, controller: controller, info: info });
+					}, function () {
+						resolve({ iframe: iframe, controller: controller, info: info });
+					});
 				} catch (error) {
 					iframe.remove();
 					reject(error);

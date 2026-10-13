@@ -775,7 +775,7 @@ function apply_image_transformation(meta, fn, { snapshot = false } = {}) {
 
 	// 2draw: transformed drawImage (skew, arbitrary rotation) isn't pixel-identical across browsers,
 	// so the recorder stores the result and replay uses it.
-	if (snapshot) {
+	if (snapshot && window.P95.behavior < 2) {
 		if (window.P95.replaying) {
 			const data = window.P95.take("transform");
 			if (data) {
@@ -864,6 +864,10 @@ function flip_vertical_impl() {
  * @param {number} angle - The angle of rotation in radians.
  */
 function rotate_impl(angle) {
+	if (window.P95.behavior >= 2) {
+		rotate_nearest_neighbor(angle);
+		return;
+	}
 	apply_image_transformation({
 		name: `${localize("Rotate by angle")} ${angle / TAU * 360} ${localize("Degrees")}`,
 		icon: get_help_folder_icon(`p_rotate_${angle >= 0 ? "cw" : "ccw"}.png`),
@@ -947,6 +951,10 @@ function rotate_impl(angle) {
  * @param {number} v_skew - The vertical skew angle in radians.
  */
 function stretch_and_skew_impl(x_scale, y_scale, h_skew, v_skew) {
+	if (window.P95.behavior >= 2) {
+		stretch_and_skew_nearest_neighbor(x_scale, y_scale, h_skew, v_skew);
+		return;
+	}
 	apply_image_transformation({
 		name:
 			(h_skew !== 0 || v_skew !== 0) ? (
@@ -1008,6 +1016,157 @@ function stretch_and_skew_impl(x_scale, y_scale, h_skew, v_skew) {
 		new_ctx.restore();
 	}, { snapshot: true });
 }
+
+// #region Nearest-neighbor transforms (2draw, P95 ENGINE_BEHAVIOR 2)
+// Like Paint: each output pixel takes the input pixel under its center. Pure JS arithmetic, so it's the same in every
+// browser (canvas drawImage with a transform resamples differently between browsers), and recordings need no stored pixels.
+
+/**
+ * @param {PixelCanvas} original_canvas
+ * @param {PixelCanvas} new_canvas - already sized (and filled with the background, if any)
+ * @param {(x: number, y: number) => [number, number]} source_point - output pixel center -> input coordinates
+ */
+function resample_nearest_neighbor(original_canvas, new_canvas, source_point) {
+	const w = original_canvas.width;
+	const h = original_canvas.height;
+	const src = original_canvas.ctx.getImageData(0, 0, w, h).data;
+	const out_image_data = new_canvas.ctx.getImageData(0, 0, new_canvas.width, new_canvas.height);
+	const out = out_image_data.data;
+	for (let y = 0; y < new_canvas.height; y++) {
+		for (let x = 0; x < new_canvas.width; x++) {
+			const [sx, sy] = source_point(x + 0.5, y + 0.5);
+			const u = Math.floor(sx);
+			const v = Math.floor(sy);
+			if (u < 0 || v < 0 || u >= w || v >= h) {
+				continue;
+			}
+			const si = (v * w + u) * 4;
+			const oi = (y * new_canvas.width + x) * 4;
+			const a = src[si + 3];
+			if (a === 255) {
+				out[oi] = src[si];
+				out[oi + 1] = src[si + 1];
+				out[oi + 2] = src[si + 2];
+				out[oi + 3] = 255;
+			} else if (a > 0) {
+				// source-over, in integers
+				const da = out[oi + 3];
+				const oa = a * 255 + da * (255 - a); // (scaled by 255)
+				for (let c = 0; c < 3; c++) {
+					out[oi + c] = Math.round((src[si + c] * a * 255 + out[oi + c] * da * (255 - a)) / oa);
+				}
+				out[oi + 3] = Math.round(oa / 255);
+			}
+		}
+	}
+	new_canvas.ctx.putImageData(out_image_data, 0, 0);
+}
+
+/** @param {number} angle - radians */
+function rotate_nearest_neighbor(angle) {
+	apply_image_transformation({
+		name: `${localize("Rotate by angle")} ${angle / TAU * 360} ${localize("Degrees")}`,
+		icon: get_help_folder_icon(`p_rotate_${angle >= 0 ? "cw" : "ccw"}.png`),
+	}, (original_canvas, _original_ctx, new_canvas, new_ctx) => {
+		const w = original_canvas.width;
+		const h = original_canvas.height;
+		if (angle === TAU / 4 || angle === TAU * -3 / 4) {
+			new_canvas.width = h;
+			new_canvas.height = w;
+			resample_nearest_neighbor(original_canvas, new_canvas, (x, y) => [y, h - x]);
+		} else if (angle === TAU / 2 || angle === TAU / -2) {
+			resample_nearest_neighbor(original_canvas, new_canvas, (x, y) => [w - x, h - y]);
+		} else if (angle === TAU * 3 / 4 || angle === TAU / -4) {
+			new_canvas.width = h;
+			new_canvas.height = w;
+			resample_nearest_neighbor(original_canvas, new_canvas, (x, y) => [w - y, x]);
+		} else {
+			const cos = Math.cos(angle);
+			const sin = Math.sin(angle);
+			// bounding box of the rotated image (same as the drawImage version)
+			let bb_min_x = +Infinity;
+			let bb_max_x = -Infinity;
+			let bb_min_y = +Infinity;
+			let bb_max_y = -Infinity;
+			for (const [cx, cy] of [[0, 0], [w, 0], [0, h], [w, h]]) {
+				const x = cos * cx - sin * cy;
+				const y = sin * cx + cos * cy;
+				bb_min_x = Math.min(bb_min_x, x);
+				bb_max_x = Math.max(bb_max_x, x);
+				bb_min_y = Math.min(bb_min_y, y);
+				bb_max_y = Math.max(bb_max_y, y);
+			}
+			new_canvas.width = Math.max(1, Math.floor(bb_max_x - bb_min_x));
+			new_canvas.height = Math.max(1, Math.floor(bb_max_y - bb_min_y));
+			if (!transparency) {
+				new_ctx.fillStyle = selected_colors.background;
+				new_ctx.fillRect(0, 0, new_canvas.width, new_canvas.height);
+			}
+			// output (x, y) = R(angle) * input - bb_min, so input = R(-angle) * (output + bb_min)
+			resample_nearest_neighbor(original_canvas, new_canvas, (x, y) => {
+				const px = x + bb_min_x;
+				const py = y + bb_min_y;
+				return [cos * px + sin * py, -sin * px + cos * py];
+			});
+		}
+	});
+}
+
+/**
+ * @param {number} x_scale
+ * @param {number} y_scale
+ * @param {number} h_skew - radians
+ * @param {number} v_skew - radians
+ */
+function stretch_and_skew_nearest_neighbor(x_scale, y_scale, h_skew, v_skew) {
+	apply_image_transformation({
+		name:
+			(h_skew !== 0 || v_skew !== 0) ? (
+				(x_scale !== 1 || y_scale !== 1) ? localize("Stretch and Skew") : localize("Skew")
+			) : localize("Stretch"),
+		icon: get_help_folder_icon(
+			(h_skew !== 0) ? "p_skew_h.png" :
+				(v_skew !== 0) ? "p_skew_v.png" :
+					(y_scale !== 1) ? (
+						(x_scale !== 1) ? "p_stretch_both.png" : "p_stretch_v.png"
+					) : "p_stretch_h.png"
+		),
+	}, (original_canvas, _original_ctx, new_canvas, new_ctx) => {
+		const w = original_canvas.width * x_scale;
+		const h = original_canvas.height * y_scale;
+		const th = Math.tan(h_skew);
+		const tv = Math.tan(v_skew);
+		// output = [1 th; tv 1] * (scaled input) - bb_min
+		let bb_min_x = +Infinity;
+		let bb_max_x = -Infinity;
+		let bb_min_y = +Infinity;
+		let bb_max_y = -Infinity;
+		for (const [cx, cy] of [[0, 0], [w, 0], [0, h], [w, h]]) {
+			const x = cx + th * cy;
+			const y = tv * cx + cy;
+			bb_min_x = Math.min(bb_min_x, x);
+			bb_max_x = Math.max(bb_max_x, x);
+			bb_min_y = Math.min(bb_min_y, y);
+			bb_max_y = Math.max(bb_max_y, y);
+		}
+		new_canvas.width = Math.max(1, Math.floor(bb_max_x - bb_min_x));
+		new_canvas.height = Math.max(1, Math.floor(bb_max_y - bb_min_y));
+		if (!transparency) {
+			new_ctx.fillStyle = selected_colors.background;
+			new_ctx.fillRect(0, 0, new_canvas.width, new_canvas.height);
+		}
+		const det = 1 - th * tv;
+		resample_nearest_neighbor(original_canvas, new_canvas, (x, y) => {
+			const px = x + bb_min_x;
+			const py = y + bb_min_y;
+			const sx = (px - th * py) / det;
+			const sy = (py - tv * px) / det;
+			return [sx / x_scale, sy / y_scale];
+		});
+	});
+}
+
+// #endregion
 
 /**
  * Inverts the RGB values in a canvas, optionally storing the result in a separate destination canvas.

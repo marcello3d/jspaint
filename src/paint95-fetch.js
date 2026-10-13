@@ -84,3 +84,35 @@ export async function load_image_cors(url) {
 		throw new Error(`${url}\n${fetch_error && fetch_error.message || fetch_error}\n${img_error.message}`);
 	}
 }
+
+/**
+ * Whether a starting picture can be stored by reference in a recording: an immutable, versioned 2draw picture URL
+ * like https://s3.amazonaws.com/zoraw.2draw.net/data/13/132726/132726-v1.png
+ * @param {string | null} url
+ */
+export function is_reference_url(url) {
+	if (!url) return false;
+	try {
+		const parsed = new URL(url);
+		return /^https?:$/.test(parsed.protocol) && !parsed.search && /\/data\/\d+\/\d+\/\d+-v\d+\.(png|jpe?g)$/i.test(parsed.pathname);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Loads a picture for replay the way the editor loaded it (fetch + the engine's decoder), composited onto a white
+ * canvas of the given size at the top left, as ImageData.
+ * @param {string} url
+ * @param {number} width
+ * @param {number} height
+ * @returns {Promise<ImageData>}
+ */
+export async function load_picture_image_data(url, width, height) {
+	const image = await load_image_cors(url);
+	const canvas = make_canvas(width, height);
+	canvas.ctx.fillStyle = "#ffffff";
+	canvas.ctx.fillRect(0, 0, width, height);
+	canvas.ctx.drawImage(image, 0, 0);
+	return canvas.ctx.getImageData(0, 0, width, height);
+}
