@@ -123,10 +123,18 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 		choose(thing);
 		$G.trigger("option-changed");
 	};
+	// 2draw: handlers bound by the previous render, unbound when re-rendering (they used to pile up with every
+	// tool switch, making every option change slower and slower)
+	/** @type {(() => void)[]} */
+	let unbind_previous = [];
 	$chooser.on("update", () => {
 		if (!$chooser.is(":visible")) {
 			return;
 		}
+		for (const unbind of unbind_previous) {
+			unbind();
+		}
+		unbind_previous = [];
 		$chooser.empty();
 		for (let i = 0; i < things.length; i++) {
 			((thing) => {
@@ -172,6 +180,7 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 				};
 				update();
 				$G.on("option-changed theme-load redraw-tool-options-because-webglcontextrestored", update);
+				unbind_previous.push(() => $G.off("option-changed theme-load redraw-tool-options-because-webglcontextrestored", update));
 			})(things[i]);
 		}
 
@@ -190,6 +199,7 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 			}
 			event.preventDefault();
 		};
+		$chooser.off("pointerdown click");
 		$chooser.on("pointerdown click", (event) => {
 			const option_container = event.target.closest(".chooser-option");
 			if (option_container) {
@@ -201,10 +211,12 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 				$chooser.on("touchmove", ontouchmove_while_pointer_down);
 			}
 		});
-		$G.on("pointerup pointercancel", () => {
+		const on_pointer_release = () => {
 			$chooser.off("pointerover", onpointerover_while_pointer_down);
 			$chooser.off("touchmove", ontouchmove_while_pointer_down);
-		});
+		};
+		$G.on("pointerup pointercancel", on_pointer_release);
+		unbind_previous.push(() => $G.off("pointerup pointercancel", on_pointer_release));
 	});
 	return $chooser;
 };

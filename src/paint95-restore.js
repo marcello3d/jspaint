@@ -56,8 +56,21 @@ export async function restore_history(file, { width, height, expected_image_data
 		controller.load_file(file);
 		controller.ondrift = (details) => { drift = drift || details; };
 		await controller.prepare(); // starting pictures stored by URL
+		// Work in slices, yielding with a message (not a frame: no idle wait for the next frame) so input and painting
+		// (the progress bar) can happen in between.
+		const channel = new MessageChannel();
+		const yield_to_browser = () => new Promise((resolve) => {
+			channel.port1.onmessage = () => resolve();
+			channel.port2.postMessage(null);
+		});
+		let last_paint = performance.now();
 		while (!controller.done) {
-			await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+			await yield_to_browser();
+			if (performance.now() - last_paint > 200) {
+				// make sure the progress bar gets painted now and then
+				await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+				last_paint = performance.now();
+			}
 			controller.advance_to(Infinity, RESTORE_SLICE_MS);
 			$progress.attr("value", Math.round(100 * controller.position / controller.timeline.length));
 		}
