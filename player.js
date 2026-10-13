@@ -99,6 +99,7 @@
 				self._advance(Infinity);
 				self._render();
 				self._emit_time();
+				self._prepare_spare();
 				if (self._options.autoplay) {
 					self.play();
 				}
@@ -240,8 +241,11 @@
 		var going_back = ms < self._time || (self._processed > ms);
 		self._time = ms;
 		if (going_back && self._controller) {
-			// Replay from the start (fast) in a fresh engine.
-			var restart = self._create_frame().then(function (frame) {
+			// Replay from the start (fast) in a fresh engine: the spare one loaded in the background, if it's there.
+			var next = self._spare || self._create_frame();
+			next.claimed = true;
+			self._spare = null;
+			var restart = next.then(function (frame) {
 				if (self._restarting !== restart) {
 					frame.iframe.remove();
 					return;
@@ -250,6 +254,7 @@
 				self._install(frame);
 				self._caught_up = false;
 				self._schedule();
+				self._prepare_spare();
 			}, function (error) {
 				self._restarting = null;
 				if (self._options.onError) {
@@ -262,6 +267,26 @@
 		}
 		self._emit_time();
 		self._schedule();
+	};
+
+	/** Loads a second engine in the background (at the start), so seeking backwards doesn't wait for one to load. */
+	Paint95Player.prototype._prepare_spare = function () {
+		var self = this;
+		if (self._spare || self._destroyed) {
+			return;
+		}
+		var spare = self._create_frame();
+		self._spare = spare;
+		spare.then(function (frame) {
+			// (a spare that seek() took is installed there)
+			if (self._destroyed || (!spare.claimed && self._spare !== spare)) {
+				frame.iframe.remove();
+			}
+		}, function () {
+			if (self._spare === spare) {
+				self._spare = null;
+			}
+		});
 	};
 
 	Paint95Player.prototype.setSpeed = function (multiplier) {
@@ -279,6 +304,10 @@
 		}
 		if (this._frame) {
 			this._frame.iframe.remove();
+		}
+		if (this._spare) {
+			this._spare.then(function (frame) { frame.iframe.remove(); }, function () { });
+			this._spare = null;
 		}
 		this._container.remove();
 	};
@@ -319,6 +348,13 @@
 		if (!this._controller) {
 			return;
 		}
+		// nothing happened since the last frame: keep it (most frames, between strokes and while paused)
+		var key = this._controller.version + ":" + (this._time < this._duration);
+		if (this._rendered_key === key && this._rendered_frame === this._frame) {
+			return;
+		}
+		this._rendered_key = key;
+		this._rendered_frame = this._frame;
 		var frame = this._controller.get_frame();
 		var source = frame.canvas;
 		if (this._canvas.width !== source.width || this._canvas.height !== source.height) {

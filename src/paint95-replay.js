@@ -59,6 +59,8 @@ export class ReplayController {
 		/** @type {(drift: any) => void} */
 		this.ondrift = () => { };
 		this.done = false;
+		/** bumped for every processed event, so the player can skip redrawing an unchanged frame */
+		this.version = 0;
 	}
 
 	/**
@@ -143,6 +145,7 @@ export class ReplayController {
 		const start = performance.now();
 		while (this.position < this.timeline.length && this.timeline[this.position].t <= time) {
 			const entry = this.timeline[this.position++];
+			this.version++;
 			try {
 				this.process(entry);
 			} catch (error) {
