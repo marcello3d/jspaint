@@ -987,6 +987,34 @@ async function test_no_font_permission(recording_with_text) {
 	check(replay.ended && calls === 0, `fonts: playing a recording with text doesn't call queryLocalFonts (${calls} calls)`);
 }
 
+/** ENGINE_BEHAVIOR 3: on a big canvas the history is pruned while drawing; undo past the limit replays identically. */
+async function test_history_cap() {
+	const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
+	watch(editor, "historycap/editor");
+	const width = 1600;
+	const height = 1600; // 10 MB per step: keep 12, pruned at 25
+	const recording = await record_session(editor, {
+		width, height, script: async (t) => {
+			await t.tool("Pencil");
+			for (let i = 0; i < 30; i++) {
+				await t.drag([[5 + i * 3, 5], [5 + i * 3, 40]]);
+			}
+			for (let i = 0; i < 20; i++) {
+				await t.page.keyboard.press("Control+z");
+			}
+			await t.drag([[10, 60], [100, 60]]);
+		},
+	});
+	const nodes = await editor.evaluate(() => window.P95.history_size()).catch(() => -1);
+	await editor.close();
+	check(nodes > 0 && nodes <= 2 * 12 + 1, `historycap: the history is capped while drawing (${nodes} steps kept)`);
+	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "historycap/player");
+	const replay = await replay_session(page, recording);
+	await page.close();
+	compare("historycap", recording, replay);
+}
+
 /** Recordings made with ENGINE_BEHAVIOR 1 (transforms stored as pixels, v1 container) still replay exactly. */
 async function test_behavior1_fixtures() {
 	for (const name of ["image_menu-behavior1-v1", "all_tools-behavior1-v1"]) {
@@ -1088,6 +1116,9 @@ try {
 	}
 	if (wanted("fonts")) {
 		await test_no_font_permission(recordings.all_tools);
+	}
+	if (wanted("historycap")) {
+		await test_history_cap();
 	}
 	if (wanted("behavior1")) {
 		await test_behavior1_fixtures();
