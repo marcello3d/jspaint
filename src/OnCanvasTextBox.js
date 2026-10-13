@@ -261,6 +261,14 @@ class OnCanvasTextBox extends OnCanvasObject {
 		$status_size.text("");
 		$canvas_area.trigger("resize"); // could use "update" event instead if this is just to hide the main canvas handles
 
+		if (window.P95.replaying) {
+			// 2draw: no font box (text toolbar) when replaying; the text's pixels come from the recording,
+			// and the preview just uses the recorded font.
+			update();
+			$(window).on("resize", this._on_window_resize = () => { }); // (destroy() unbinds it)
+			return;
+		}
+
 		if (OnCanvasTextBox.$fontbox && OnCanvasTextBox.$fontbox.closed) {
 			// This might never happen anymore given the "close" event handler that hides instead of closing the font box.
 			OnCanvasTextBox.$fontbox = null;

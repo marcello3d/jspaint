@@ -4,47 +4,38 @@ import { $ToolWindow } from "./$ToolWindow.js";
 // import { localize } from "./app-localization.js";
 import { $G, E, supports_vertical_writing_mode } from "./helpers.js";
 
-const eachFont = async (callback, afterAllCallback) => {
-	function localFontAccessUnavailable() {
-		FontDetective.each(callback);
-		FontDetective.all(afterAllCallback);
-	}
-	if (window.queryLocalFonts) {
-		let availableFonts;
-		try {
-			availableFonts = await window.queryLocalFonts();
-		} catch (error) {
-			console.log("queryLocalFonts failed:", error, "\nFalling back to FontDetective.");
-			localFontAccessUnavailable();
-			return;
-		}
-		if (availableFonts.length === 0) {
-			console.log("queryLocalFonts returned no fonts; falling back to FontDetective.");
-			localFontAccessUnavailable();
-			return;
-		}
-		const familyNames = new Set();
-		for (const font of availableFonts) {
-			if (familyNames.has(font.family)) {
-				continue;
-			}
-			familyNames.add(font.family);
-			callback({
-				name: font.family,
-				toString() {
-					return '"' + this.name.replace(/\\/g, "\\\\").replace(/"/g, "\\\"") + '"';
-				},
-			});
-			// This class is not exported by FontDetective.
-			// That said, this queryLocalFonts functionality should be moved into FontDetective.
-			// callback(new FontDetective.Font(font.family));
-		}
-		afterAllCallback();
-	} else {
-		console.log("queryLocalFonts unavailable; falling back to FontDetective.");
-		localFontAccessUnavailable();
-	}
+// 2draw: fonts are found with FontDetective (measuring common fonts; no permission needed).
+// The Local Font Access API (window.queryLocalFonts) shows a permission prompt, so it's only used
+// when the user picks "More fonts…" in the dropdown (see below), never automatically.
+const eachFont = (callback, afterAllCallback) => {
+	FontDetective.each(callback);
+	FontDetective.all(afterAllCallback);
 };
+
+/**
+ * Lists the fonts installed on the system with the Local Font Access API. Needs a user gesture (shows a prompt).
+ * @returns {Promise<{ name: string, toString(): string }[]>}
+ */
+async function queryLocalFontFamilies() {
+	const availableFonts = await window.queryLocalFonts();
+	const familyNames = new Set();
+	const fonts = [];
+	for (const font of availableFonts) {
+		if (familyNames.has(font.family)) {
+			continue;
+		}
+		familyNames.add(font.family);
+		fonts.push({
+			name: font.family,
+			toString() {
+				return '"' + this.name.replace(/\\/g, "\\\\").replace(/"/g, "\\\"") + '"';
+			},
+		});
+	}
+	return fonts;
+}
+
+const MORE_FONTS_VALUE = "more-fonts"; // (real values are quoted family names)
 
 /**
  * @returns {OSGUI$Window}
@@ -93,7 +84,10 @@ function $FontBox() {
 	};
 
 	const originalFamily = text_tool_font.family;
-	eachFont((font) => {
+	const add_font_option = (font) => {
+		if ($family.children("option").filter((_i, el) => el.value === String(font)).length) {
+			return;
+		}
 		const $option = $(E("option"));
 		$option.val(font).text(font.name);
 		// Insert in alphabetical order
@@ -109,11 +103,19 @@ function $FontBox() {
 		} else {
 			$family.append($option);
 		}
+		$family.append($more_fonts); // keep "More fonts…" last
 		// Select the first known-available font, just in case FontDetective.each is slow.
 		if (!text_tool_font.family) {
 			update_font();
 		}
-	}, () => {
+	};
+	// "More fonts…": the full system font list, asked for only when chosen (it shows a permission prompt)
+	let $more_fonts = $();
+	if (window.queryLocalFonts) {
+		$more_fonts = $(E("option")).val(MORE_FONTS_VALUE).text("More fonts…");
+		$family.append($more_fonts);
+	}
+	eachFont(add_font_option, () => {
 		// All fonts have been added to the list. Now we can select the default font.
 		$family.val(originalFamily);
 		// Liberation Sans is designed to be metrically compatible with Arial,
@@ -132,7 +134,25 @@ function $FontBox() {
 		$family.val(text_tool_font.family);
 	}
 
-	$family.on("change", update_font);
+	let family_before_more = text_tool_font.family;
+	$family.on("change", async () => {
+		if ($family.val() !== MORE_FONTS_VALUE) {
+			family_before_more = $family.val();
+			update_font();
+			return;
+		}
+		$family.val(family_before_more);
+		try {
+			const fonts = await queryLocalFontFamilies();
+			for (const font of fonts) {
+				add_font_option(font);
+			}
+			$more_fonts.remove();
+		} catch (error) {
+			console.log("queryLocalFonts failed:", error);
+		}
+		$family.val(family_before_more);
+	});
 	$size.on("change", update_font);
 
 	const $w = $ToolWindow();
