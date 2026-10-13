@@ -117,7 +117,25 @@ async function profiled(label, cdp, fn) {
 	const total = [...self.values()].reduce((a, b) => a + b, 0);
 	const top = [...self.entries()].filter(([k]) => !/^\((idle|program|garbage collector)\)/.test(k)).sort((a, b) => b[1] - a[1]).slice(0, 8);
 	console.log(`  profile ${label}: ${total.toFixed(0)} ms sampled`);
-	for (const [k, ms] of top) console.log(`    ${ms.toFixed(1).padStart(8)} ms  ${k}`);
+	const parent_of = new Map();
+	for (const n of p.nodes) for (const c of n.children || []) parent_of.set(c, n);
+	const name_of = (n) => `${n.callFrame.functionName || "(anonymous)"} ${n.callFrame.url.split("/").pop()}:${n.callFrame.lineNumber + 1}`;
+	for (const [k, ms] of top) {
+		console.log(`    ${ms.toFixed(1).padStart(8)} ms  ${k}`);
+		if (arg("callers", false)) {
+			// who calls it (two levels up), by time
+			const callers = new Map();
+			p.samples.forEach((id, i) => {
+				const node = by_id.get(id);
+				if (name_of(node) !== k) return;
+				const p1 = parent_of.get(node.id);
+				const p2 = p1 && parent_of.get(p1.id);
+				const key = `${p1 ? name_of(p1) : "?"} <- ${p2 ? name_of(p2) : "?"}`;
+				callers.set(key, (callers.get(key) || 0) + (dt[i] || 0) / 1000);
+			});
+			for (const [c, cms] of [...callers].sort((a, b) => b[1] - a[1]).slice(0, 4)) console.log(`               ${cms.toFixed(1).padStart(8)} ms  ${c}`);
+		}
+	}
 	return out;
 }
 

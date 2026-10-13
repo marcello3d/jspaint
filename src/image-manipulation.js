@@ -289,8 +289,12 @@ function update_brush_for_drawing_lines(stroke_size) {
 function draw_line_without_pattern_support(ctx, x1, y1, x2, y2, stroke_size = 1) {
 	if (aliasing) {
 		if (stroke_size > 1) {
+			// (drawing straight onto the destination in a colour: see draw_with_swatch)
+			const brush = direct_draw_color ? colored_brush(line_brush_canvas, direct_draw_color) : line_brush_canvas;
+			const half_width = line_brush_canvas.width / 2;
+			const half_height = line_brush_canvas.height / 2;
 			bresenham_line(x1, y1, x2, y2, (x, y) => {
-				ctx.drawImage(line_brush_canvas, ~~(x - line_brush_canvas.width / 2), ~~(y - line_brush_canvas.height / 2));
+				ctx.drawImage(brush, ~~(x - half_width), ~~(y - half_height));
 			});
 		} else {
 			bresenham_line(x1, y1, x2, y2, (x, y) => {
@@ -1386,7 +1390,7 @@ function draw_bezier_curve(ctx, start_x, start_y, control_1_x, control_1_y, cont
 	const max_y = Math.max(start_y, control_1_y, control_2_y, end_y);
 	draw_with_swatch(ctx, min_x, min_y, max_x, max_y, stroke_color, (op_ctx_2d) => {
 		draw_bezier_curve_without_pattern_support(op_ctx_2d, start_x, start_y, control_1_x, control_1_y, control_2_x, control_2_y, end_x, end_y, stroke_size);
-	});
+	}, aliasing);
 }
 
 /**
@@ -1406,7 +1410,7 @@ function draw_line(ctx, x1, y1, x2, y2, stroke_size) {
 	const max_y = Math.max(y1, y2);
 	draw_with_swatch(ctx, min_x, min_y, max_x, max_y, stroke_color, (op_ctx_2d) => {
 		draw_line_without_pattern_support(op_ctx_2d, x1, y1, x2, y2, stroke_size);
-	});
+	}, aliasing);
 	// also works:
 	// draw_line_strip(ctx, [{ x: x1, y: y1 }, { x: x2, y: y2 }]);
 }
@@ -2054,6 +2058,57 @@ export function copy_contents_within_polygon(canvas, points, x_min, y_min, x_max
 	return cutout_crop;
 }
 
+/** set while draw_with_swatch draws straight onto the destination */
+let direct_draw_color = null;
+/** @type {WeakMap<HTMLCanvasElement, Map<string, PixelCanvas>>} */
+const colored_brushes = new WeakMap();
+/**
+ * @param {HTMLCanvasElement} brush - black on transparent
+ * @param {string} color - opaque
+ */
+function colored_brush(brush, color) {
+	let by_color = colored_brushes.get(brush);
+	if (!by_color) {
+		colored_brushes.set(brush, by_color = new Map());
+	}
+	if (!by_color.has(color)) {
+		const canvas = make_canvas(brush);
+		replace_colors_with_swatch(canvas.ctx, color, 0, 0);
+		by_color.set(color, canvas);
+	}
+	return by_color.get(color);
+}
+/** @type {WeakMap<HTMLCanvasElement, boolean>} */
+const binary_alpha = new WeakMap();
+/** @param {HTMLCanvasElement} canvas */
+function is_binary_alpha(canvas) {
+	if (!binary_alpha.has(canvas)) {
+		const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+		let binary = true;
+		for (let i = 3; i < data.length; i += 4) {
+			if (data[i] !== 0 && data[i] !== 255) {
+				binary = false;
+				break;
+			}
+		}
+		binary_alpha.set(canvas, binary);
+	}
+	return binary_alpha.get(canvas);
+}
+const opaque_colors = new Map();
+/** @param {string} color */
+function is_opaque_color(color) {
+	if (!opaque_colors.has(color)) {
+		opaque_colors.set(color, get_rgba_from_color(color)[3] === 255);
+	}
+	return opaque_colors.get(color);
+}
+/** @param {CanvasRenderingContext2D} ctx */
+function is_identity_transform(ctx) {
+	const m = ctx.getTransform();
+	return m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1 && m.e === 0 && m.f === 0;
+}
+
 // @TODO: maybe shouldn't be external...
 /**
  * @param {CanvasRenderingContext2D} ctx
@@ -2064,8 +2119,43 @@ export function copy_contents_within_polygon(canvas, points, x_min, y_min, x_max
  * @param {CanvasPattern | string} swatch
  * @param {(ctx: CanvasRenderingContext2D) => void} callback
  */
-export function draw_with_swatch(ctx, x_min, y_min, x_max, y_max, swatch, callback) {
+export function draw_with_swatch(ctx, x_min, y_min, x_max, y_max, swatch, callback, pixels_only = false) {
 	const stroke_margin = ~~(stroke_size * 1.1);
+
+	// 2draw: when the callback only sets whole pixels (fillRect at integer coordinates) and the colour is opaque, drawing
+	// them straight onto the destination gives exactly the same pixels as drawing black on a scratch canvas,
+	// recolouring it and compositing it, without the scratch canvas (the costly part when replaying curves).
+	// For thick lines, the line brush is stamped already coloured, which is exact as long as it's fully opaque or
+	// fully transparent in every pixel.
+	if (
+		pixels_only && typeof swatch === "string" && is_opaque_color(swatch) &&
+		Number.isInteger(x_min - stroke_margin) && Number.isInteger(y_min - stroke_margin) &&
+		(stroke_size <= 1 || !line_brush_canvas || is_binary_alpha(line_brush_canvas)) &&
+		ctx.globalCompositeOperation === "source-over" && ctx.globalAlpha === 1 && is_identity_transform(ctx)
+	) {
+		ctx.save();
+		ctx.fillStyle = swatch;
+		direct_draw_color = swatch;
+		try {
+			// (everything drawn is within the rectangle the scratch canvas would have covered)
+			const x = x_min - stroke_margin;
+			const y = y_min - stroke_margin;
+			const rect = { x0: x, y0: y, x1: Math.max(x_max, x_min + 1) + stroke_margin, y1: Math.max(y_max, y_min + 1) + stroke_margin };
+			// clipped like the scratch canvas was (an integer rectangle: exact)
+			ctx.beginPath();
+			ctx.rect(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0);
+			ctx.clip();
+			if (ctx.canvas.bulk_draw) {
+				ctx.canvas.bulk_draw(rect, () => callback(ctx));
+			} else {
+				callback(ctx);
+			}
+		} finally {
+			direct_draw_color = null;
+			ctx.restore();
+		}
+		return;
+	}
 
 	x_max = Math.max(x_max, x_min + 1);
 	y_max = Math.max(y_max, y_min + 1);

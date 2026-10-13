@@ -213,6 +213,8 @@ function image_data_match(a, b, threshold) {
 
 /** @typedef {{ x0: number, y0: number, x1: number, y1: number }} Bounds */
 
+const CANVAS_WIDTH = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, "width");
+const CANVAS_HEIGHT = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, "height");
 /** Composite operations that only affect pixels where the canvas already has content (so its bounds can't grow) */
 const CONTAINED_COMPOSITE_OPERATIONS = new Set(["source-in", "destination-in", "source-atop"]);
 /** Composite operations that only affect pixels inside what's drawn */
@@ -229,8 +231,22 @@ const LOCAL_COMPOSITE_OPERATIONS = new Set([
 function track_canvas_bounds(canvas, ctx) {
 	/** @type {Bounds | null} */
 	let bounds = null;
+	// cached size (reading canvas.width/height is slow-ish, and touched() needs it on every call)
+	let canvas_width = canvas.width;
+	let canvas_height = canvas.height;
 	Object.defineProperty(canvas, "content_bounds", { configurable: true, get: () => bounds });
-	const all = () => ({ x0: 0, y0: 0, x1: canvas.width, y1: canvas.height });
+	// Many small drawing calls inside a known rectangle: account for the rectangle once, skip per-call tracking.
+	let bulk = false;
+	canvas.bulk_draw = (rect, fn) => {
+		touched(rect);
+		bulk = true;
+		try {
+			return fn();
+		} finally {
+			bulk = false;
+		}
+	};
+	const all = () => ({ x0: 0, y0: 0, x1: canvas_width, y1: canvas_height });
 	/**
 	 * @param {Bounds | null} b - null: unknown, anywhere
 	 * @param {boolean} [adds_content] - false for clearing (changes pixels, but adds no content)
@@ -239,8 +255,8 @@ function track_canvas_bounds(canvas, ctx) {
 		const rect = b ? {
 			x0: Math.max(0, Math.floor(b.x0) - 1),
 			y0: Math.max(0, Math.floor(b.y0) - 1),
-			x1: Math.min(canvas.width, Math.ceil(b.x1) + 1),
-			y1: Math.min(canvas.height, Math.ceil(b.y1) + 1),
+			x1: Math.min(canvas_width, Math.ceil(b.x1) + 1),
+			y1: Math.min(canvas_height, Math.ceil(b.y1) + 1),
 		} : all();
 		if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0) {
 			return;
@@ -263,6 +279,8 @@ function track_canvas_bounds(canvas, ctx) {
 			get() { return descriptor.get.call(this); },
 			set(value) {
 				descriptor.set.call(this, value);
+				canvas_width = CANVAS_WIDTH.get.call(canvas);
+				canvas_height = CANVAS_HEIGHT.get.call(canvas);
 				bounds = null; // cleared
 				canvas.on_draw?.(null); // (everything changed)
 			},
@@ -274,14 +292,28 @@ function track_canvas_bounds(canvas, ctx) {
 		if (bounds) canvas.on_draw?.(bounds);
 		return true;
 	};
-	/** the translation of the current transform, or null if it scales/rotates */
+	// the translation of the current transform, or null if it scales/rotates
+	// (getTransform() is only needed once the transform has been changed at all)
+	const IDENTITY = { e: 0, f: 0 };
+	let transform_used = false;
+	for (const name of ["translate", "scale", "rotate", "transform", "setTransform", "resetTransform"]) {
+		const original = ctx[name];
+		ctx[name] = function () {
+			transform_used = true;
+			return original.apply(this, arguments);
+		};
+	}
 	const translation = () => {
+		if (!transform_used) return IDENTITY;
 		const m = ctx.getTransform();
 		return (m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1) ? m : null;
 	};
 	const rect_op = (name, { composite = true, pad = () => 0 } = {}) => {
 		const original = ctx[name];
 		ctx[name] = function (x, y, w, h) {
+			if (bulk) {
+				return original.apply(this, arguments);
+			}
 			if (composite && contained()) {
 				return original.apply(this, arguments);
 			}
@@ -302,6 +334,9 @@ function track_canvas_bounds(canvas, ctx) {
 	// clearing changes pixels but never adds content; clearing everything empties the canvas
 	const original_clear_rect = ctx.clearRect;
 	ctx.clearRect = function (x, y, w, h) {
+		if (bulk) {
+			return original_clear_rect.apply(this, arguments);
+		}
 		const t = translation();
 		if (!t) {
 			canvas.on_draw?.(null);
@@ -311,7 +346,7 @@ function track_canvas_bounds(canvas, ctx) {
 			const x1 = x0 + Math.abs(w);
 			const y1 = y0 + Math.abs(h);
 			touched({ x0, y0, x1, y1 }, false);
-			if (x0 <= 0 && y0 <= 0 && x1 >= canvas.width && y1 >= canvas.height) {
+			if (x0 <= 0 && y0 <= 0 && x1 >= canvas_width && y1 >= canvas_height) {
 				bounds = null;
 			}
 		}
@@ -328,6 +363,9 @@ function track_canvas_bounds(canvas, ctx) {
 	}
 	const original_draw_image = ctx.drawImage;
 	ctx.drawImage = function (image, ...args) {
+		if (bulk) {
+			return original_draw_image.apply(this, arguments);
+		}
 		if (contained()) {
 			return original_draw_image.apply(this, arguments);
 		}
