@@ -212,8 +212,37 @@ localStorage. `player.js` creates it as a hidden same-origin iframe and drives `
 - playback time (display only; the engine always sees the recorded times): while a pointer is down, recorded timing
   (a pointer held still counts at most 1 s); pauses before a stroke or a picture-changing command count at most 250 ms;
   events that don't change the picture (`s`, `h`, `p`, `b`, `select_tool`) take no time. Times the speed. Constants at the
-  top of `src/paint95-replay.js`. Seeking backwards replays from the start in a fresh iframe;
+  top of `src/paint95-replay.js`. Seeking restores an in-memory checkpoint (see Seeking);
 - pictures by reference (starting pictures, and the final picture passed as `finalImageUrl` by the page) are fetched
   before playing (with the same cache-busting CORS fetch as the editor) and checked against their hashes;
 - on a hash mismatch the player reports `onDrift` and keeps going; at the end it snaps to the final picture (a v1 file's
   stored one, or `finalImageUrl`). A missing starting picture means replaying from white.
+
+### Seeking
+
+The player keeps in-memory checkpoints of the replay (`src/paint95-checkpoint.js`; nothing is stored in the file), and a
+seek restores the latest one at or before the target and replays from there in the same engine (a forward seek too,
+when a checkpoint ahead saves enough replay work). There's always one right after the start, so a seek never needs a
+fresh engine; one is created only if checkpoints are off (no memory) or a restore fails.
+
+- Taken as the replay goes, about every 250 ms of replay work, and only between strokes: no pointer down, no floating
+  selection or text box, no polygon or curve in progress, nothing to cancel back to. That works the same for every
+  engine behavior (1–4), since all of them keep their history as patches and get their randomness from the seeded PRNG.
+- A checkpoint holds the canvas (and the history anchor's picture, usually the same pixels) in 64 KB bands, run-length
+  encoded, sharing bands that didn't change with the previous checkpoint; the whole undo history as immutable records
+  (step ids, links, patches and selections shared with the live history and with the previous checkpoint; only the
+  anchor's picture, which changes in place, is copied); tool and option state (sizes, colors, palette, font, selected
+  tools, tools' own state and canvases, the canvas context's state); the PRNG state; the replay position, consumed
+  `b` data and drift state. Because it holds the whole history, a replay from a checkpoint never needs anything from
+  before it (an undo reaches exactly the steps the straight replay has).
+- Restoring first lets go of a gesture in progress (its handlers, floating selection or text box), then puts all of that
+  back.
+- Memory (`checkpointMemory`, default `Paint95Player.defaultCheckpointMemory()`): 16 MB per GB of
+  `navigator.deviceMemory`, at most 128 MB; without it, 32 MB on phones and 64 MB otherwise. It counts the bands, the
+  history records, and pixels that only checkpoints still keep (steps the live history has trimmed). Over budget every
+  other checkpoint is dropped (the first is kept) and they're taken half as often.
+- `seeking` stays true from `seek()` until the target frame is drawn, and no frames are drawn on the way.
+
+`npm run test:2draw-replay -- --only=checkpoints` checks thousands of random seeks (on the fixtures and the recordings,
+every engine behavior, with plenty of checkpoints and with a budget small enough to keep thinning them) against a
+straight replay: the frame and the history must be the same.

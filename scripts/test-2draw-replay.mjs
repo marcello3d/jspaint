@@ -463,6 +463,45 @@ if (process.argv.includes("--typical")) {
 	};
 }
 
+/** canvas size per session (default 320x240) */
+const session_sizes = {};
+if (process.argv.includes("--long")) {
+	// A long behavior-4 session on a big canvas (scripts/fixtures/long-v2.p95 was recorded with this): every tool,
+	// whole-canvas fills (so the history gets trimmed by memory), undo/redo bursts that branch the history, and
+	// selections moved around.
+	session_sizes.long = [800, 600];
+	sessions.long = async (t) => {
+		const { page } = t;
+		const tool_cycle = ["Pencil", "Brush", "Fill With Color", "Airbrush", "Line", "Rectangle", "Eraser/Color Eraser", "Ellipse", "Brush", "Fill With Color", "Rounded Rectangle", "Pencil"];
+		for (let stroke = 0; stroke < 180; stroke++) {
+			const tool = tool_cycle[stroke % tool_cycle.length];
+			await t.tool(tool);
+			await t.color((stroke * 5) % 28, stroke % 7 === 3 ? "right" : "left");
+			const cx = 60 + (stroke * 137) % 680;
+			const cy = 50 + (stroke * 89) % 500;
+			if (tool === "Fill With Color") {
+				await t.click(cx, cy);
+			} else {
+				const points = [];
+				for (let i = 0; i <= 24; i++) {
+					points.push([cx + Math.sin(i / 4 + stroke) * (40 + stroke % 50) + i * 2, cy + Math.cos(i / 5) * 35]);
+				}
+				await t.drag(points, { steps: 1, button: stroke % 7 === 3 ? "right" : "left", hold: tool === "Airbrush" ? 120 : 0 });
+			}
+			if (stroke % 11 === 10) {
+				for (let i = 0; i < 3; i++) await page.keyboard.press("Control+z");
+				await page.keyboard.press("Control+y");
+			}
+			if (stroke % 23 === 22) {
+				await t.tool("Select");
+				await t.drag([[cx - 40, cy - 30], [cx + 40, cy + 30]]);
+				await t.drag([[cx, cy], [cx + 30, cy + 20], [cx + 60, cy - 10]]);
+				await page.keyboard.press("Enter");
+			}
+		}
+	};
+}
+
 if (process.argv.includes("--slow")) {
 	for (const tool of ["Airbrush", "Brush", "Pencil"]) {
 		sessions[`slow_${tool}`] = async (t) => {
@@ -1280,6 +1319,200 @@ async function test_seek_hold(recording) {
 	check(result.speeds.join() === "0.5,1,2,4,8,16,64,64,1", `seekhold: the strip's speeds (0.5…16, max = 64) are accepted (${result.speeds})`);
 }
 
+/** mulberry32, for reproducible random seeks */
+function seeded_random(seed) {
+	let a = seed >>> 0;
+	return () => {
+		a = (a + 0x6D2B79F5) >>> 0;
+		let t = a;
+		t = Math.imul(t ^ (t >>> 15), t | 1);
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/** Opens a replay engine page (index.html?replay=1) with the recording loaded and prepared. */
+async function open_replay_engine(label, base64) {
+	const page = await browser.newPage({ viewport: { width: 1200, height: 1000 } });
+	watch(page, label);
+	await page.goto(`${base}/index.html?replay=1`, { waitUntil: "load" });
+	await wait_until(page, () => !!window.paint95Replay);
+	const info = await page.evaluate(async (base64) => {
+		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+		const controller = window.paint95Replay;
+		const info = controller.load(bytes.buffer);
+		await controller.prepare({});
+		// what a seek must reproduce: the frame the player shows, and the undo history behind it
+		window.__p95_state_hash = () => {
+			const view = controller.get_frame().canvas;
+			const image_data = view.getContext("2d").getImageData(0, 0, view.width, view.height);
+			const words = new Uint32Array(image_data.data.buffer);
+			let h = 0x811c9dc5 ^ view.width ^ (view.height << 16);
+			for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+			const stats = window.P95.history_stats();
+			return `${(h >>> 0).toString(16)} ${view.width}x${view.height} steps=${stats.steps} bytes=${stats.running_total} undos=${undos.length} redos=${redos.length} at=${current_history_node.id}`;
+		};
+		return { duration: info.duration, entries: controller.timeline.length, times: controller.timeline.map((entry) => entry.t) };
+	}, base64);
+	return { page, info };
+}
+
+/**
+ * Random seeks with in-memory checkpoints (src/paint95-checkpoint.js) land on exactly the frame (and undo history)
+ * of a straight replay to that time, for every fixture and engine behavior; also with a memory budget so small that
+ * checkpoints get thinned out.
+ */
+async function test_checkpoint_seeks(recordings) {
+	const logs = {};
+	for (const name of ["132730-v1", "typical-v2", "image_menu-behavior1-v1", "all_tools-behavior1-v1", "long-v2"]) {
+		const file = path.join(repo_root, "scripts", "fixtures", `${name}.p95`);
+		if (fs.existsSync(file)) logs[name] = fs.readFileSync(file).toString("base64");
+	}
+	for (const name of ["all_tools", "image_menu"]) {
+		if (recordings[name]) logs[`${name} (recorded now)`] = recordings[name].base64;
+	}
+	try {
+		const response = await fetch("https://s3.amazonaws.com/zoraw.2draw.net/data/13/132726/132726-v1.p95");
+		if (response.ok) logs["132726-v1"] = Buffer.from(await response.arrayBuffer()).toString("base64");
+	} catch (error) {
+		console.log(`checkpoints: couldn't fetch 132726-v1.p95 (${error.message}); skipping it`);
+	}
+	const per_log = Number(process.env.P95_SEEKS || 2400);
+	let total_seeks = 0;
+	for (const [name, base64] of Object.entries(logs)) {
+		const started = Date.now();
+		const reference = await open_replay_engine(`checkpoints/${name}/reference`, base64);
+		const { duration, times: entry_times } = reference.info;
+		const random = seeded_random(name.length * 7919 + 1);
+		// seeks: anywhere, a little before or after the last one (scrubbing, replaying a bit), exactly on an event's
+		// time, and the ends
+		const seeks = [];
+		let last = duration / 2;
+		for (let i = 0; i < per_log; i++) {
+			const r = random();
+			let t;
+			if (r < 0.4) t = random() * duration;
+			else if (r < 0.7) t = last + (random() - 0.6) * duration * 0.04;
+			else if (r < 0.92) t = entry_times[Math.floor(random() * entry_times.length)];
+			else t = random() < 0.5 ? 0 : duration;
+			t = Math.max(0, Math.min(duration, Math.round(t * 1000) / 1000));
+			seeks.push(t);
+			last = t;
+		}
+		const expected = await reference.page.evaluate((times) => {
+			const controller = window.paint95Replay;
+			const out = {};
+			for (const t of [...new Set(times)].sort((a, b) => a - b)) {
+				controller.advance_to(t);
+				out[t] = window.__p95_state_hash();
+			}
+			return out;
+		}, seeks);
+		await reference.page.close();
+		// two runs: plenty of checkpoints; then a budget that keeps thinning them out
+		for (const [variant, options, count] of [["many", { memory: 256 * 1024 * 1024, interval: 10 }, Math.ceil(per_log * 0.75)], ["thinned", { memory: 8 * 1024 * 1024, interval: 5 }, Math.floor(per_log * 0.25)]]) {
+			const engine = await open_replay_engine(`checkpoints/${name}/${variant}`, base64);
+			const list = variant === "many" ? seeks.slice(0, count) : seeks.slice(seeks.length - count);
+			const result = await engine.page.evaluate(({ list, expected, options }) => {
+				const controller = window.paint95Replay;
+				controller.enable_checkpoints(options);
+				const store = controller.checkpoints;
+				let restores = 0;
+				const restore = store.restore.bind(store);
+				store.restore = (...args) => { restores++; return restore(...args); };
+				const mismatches = [];
+				let refused = 0;
+				let peak_bytes = 0;
+				let peak_count = 0;
+				for (const t of list) {
+					if (!controller.seek(t)) {
+						refused++;
+						continue;
+					}
+					controller.advance_to(t);
+					const actual = window.__p95_state_hash();
+					if (actual !== expected[t] && mismatches.length < 5) {
+						mismatches.push({ t, actual, expected: expected[t] });
+					}
+					peak_bytes = Math.max(peak_bytes, store.bytes);
+					peak_count = Math.max(peak_count, store.list.length);
+				}
+				return { mismatches, refused, restores, peak_mb: Math.round(peak_bytes / 1048576 * 10) / 10, peak_count, final_count: store.list.length, interval: store.interval, disabled: store.disabled };
+			}, { list, expected, options });
+			await engine.page.close();
+			total_seeks += list.length;
+			check(result.mismatches.length === 0 && result.refused === 0 && result.restores > 0 && !result.disabled,
+				`checkpoints: ${name} (${variant}, ${Math.round((Date.now() - started) / 1000)} s): ${list.length} random seeks land exactly on the straight replay's frame and history (${result.restores} restores, up to ${result.peak_count} checkpoints / ${result.peak_mb} MB${variant === "thinned" ? `, thinned to every ${result.interval} ms of work` : ""}${result.mismatches.length ? `; MISMATCH ${JSON.stringify(result.mismatches).slice(0, 600)}` : ""}${result.refused ? `; ${result.refused} refused` : ""})`);
+		}
+	}
+	console.log(`checkpoints: ${total_seeks} random seeks in all`);
+}
+
+/**
+ * 132730 (a 100,000-event drawing): dragging the strip's scrubber backwards used to start a fresh replay engine (an
+ * iframe) for every backward seek, dozens at once, each replaying from the start; it never caught up. Now a burst of
+ * backward seeks stays in the one engine (restoring checkpoints) and lands on the straight replay's frame.
+ */
+async function test_scrub_132730() {
+	const base64 = fs.readFileSync(path.join(repo_root, "scripts", "fixtures", "132730-v1.p95")).toString("base64");
+	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "scrub");
+	await page.route(`${base}/__test_host.html`, (route) => route.fulfill({
+		contentType: "text/html",
+		body: `<!doctype html><meta charset="utf-8"><body style="margin:0"><div id="root" style="width:400px;height:300px"></div><script src="player.js"></script>`,
+	}));
+	await page.goto(`${base}/__test_host.html`, { waitUntil: "load" });
+	const result = await page.evaluate(async (base64) => {
+		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+		const player = new window.Paint95Player({ domRoot: document.getElementById("root"), lsaUrl: URL.createObjectURL(new Blob([bytes])) });
+		await player.ready;
+		const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+		const land = async () => {
+			const start = performance.now();
+			while (player.seeking && performance.now() - start < 60000) await frame();
+			return performance.now() - start;
+		};
+		player.seek(player.duration * 0.9);
+		const forward_ms = await land();
+		// drag from 90% back to 10% over ~60 frames, like the strip does on pointermove
+		let max_iframes = 0;
+		for (let i = 0; i <= 60; i++) {
+			player.seek(player.duration * (0.9 - 0.8 * i / 60));
+			max_iframes = Math.max(max_iframes, document.querySelectorAll("iframe").length);
+			await frame();
+		}
+		const land_ms = await land();
+		// then back and forth around 30%
+		for (let i = 0; i < 30; i++) {
+			player.seek(player.duration * (0.3 + 0.1 * Math.sin(i)));
+			max_iframes = Math.max(max_iframes, document.querySelectorAll("iframe").length);
+			await frame();
+		}
+		const land2_ms = await land();
+		const view = player._controller.get_frame().canvas;
+		const image_data = view.getContext("2d").getImageData(0, 0, view.width, view.height);
+		const words = new Uint32Array(image_data.data.buffer);
+		let h = 0x811c9dc5;
+		for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+		return { forward_ms, land_ms, land2_ms, max_iframes, time: player.currentTime, hash: h >>> 0, checkpoints: player._controller.checkpoints ? player._controller.checkpoints.list.length : 0 };
+	}, base64);
+	await page.close();
+	const reference = await open_replay_engine("scrub/reference", base64);
+	const expected = await reference.page.evaluate((time) => {
+		window.paint95Replay.advance_to(time);
+		const view = window.paint95Replay.get_frame().canvas;
+		const image_data = view.getContext("2d").getImageData(0, 0, view.width, view.height);
+		const words = new Uint32Array(image_data.data.buffer);
+		let h = 0x811c9dc5;
+		for (let i = 0; i < words.length; i++) h = Math.imul(h ^ words[i], 0x01000193);
+		return h >>> 0;
+	}, result.time);
+	await reference.page.close();
+	check(result.max_iframes === 1, `scrub: 132730: dragging backwards stays in one replay engine (${result.max_iframes} iframes at most)`);
+	check(result.land_ms < 3000 && result.land2_ms < 3000, `scrub: 132730: the drag lands quickly (${Math.round(result.land_ms)} ms, then ${Math.round(result.land2_ms)} ms; the first seek to 90% took ${Math.round(result.forward_ms)} ms; ${result.checkpoints} checkpoints)`);
+	check(result.hash === expected, `scrub: 132730: it lands on the straight replay's frame (${result.hash.toString(16)} vs ${expected.toString(16)})`);
+}
+
 const recordings = {};
 
 try {
@@ -1287,7 +1520,8 @@ try {
 		if (!wanted(name)) continue;
 		const editor = await browser.newPage({ viewport: { width: 1024, height: 700 } });
 		watch(editor, `${name}/editor`);
-		const recording = await record_session(editor, { width: 320, height: 240, script });
+		const [width, height] = session_sizes[name] || [320, 240];
+		const recording = await record_session(editor, { width, height, script });
 		await editor.close();
 		console.log(`${name}: ${recording.events} events, ${recording.size} bytes, event counts ${JSON.stringify(recording.counts)}`);
 		check(!recording.truncated, `${name}: recording not truncated`);
@@ -1341,6 +1575,12 @@ try {
 	}
 	if (wanted("format")) {
 		await test_format_v1_v2(recordings);
+	}
+	if (wanted("scrub")) {
+		await test_scrub_132730();
+	}
+	if (wanted("checkpoints")) {
+		await test_checkpoint_seeks(recordings);
 	}
 } finally {
 	await browser.close();
