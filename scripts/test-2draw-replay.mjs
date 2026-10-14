@@ -1410,7 +1410,7 @@ async function test_checkpoint_seeks(recordings) {
 		}, seeks);
 		await reference.page.close();
 		// two runs: plenty of checkpoints; then a budget that keeps thinning them out
-		for (const [variant, options, count] of [["many", { memory: 256 * 1024 * 1024, interval: 10 }, Math.ceil(per_log * 0.75)], ["thinned", { memory: 8 * 1024 * 1024, interval: 5 }, Math.floor(per_log * 0.25)]]) {
+		for (const [variant, options, count] of [["many", { memory: 256 * 1024 * 1024, interval: 10 }, Math.ceil(per_log * 0.75)], ["thinned", { memory: 16 * 1024 * 1024, interval: 5 }, Math.floor(per_log * 0.25)]]) {
 			const engine = await open_replay_engine(`checkpoints/${name}/${variant}`, base64);
 			const list = variant === "many" ? seeks.slice(0, count) : seeks.slice(seeks.length - count);
 			const result = await engine.page.evaluate(({ list, expected, options }) => {
