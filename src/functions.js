@@ -4851,6 +4851,162 @@ window.P95.history_stats = () => {
 };
 /** For the history restore's memory budget */
 window.P95.history_size = () => history_nodes_by_id.size;
+
+// #region Replay checkpoints (paint95-checkpoint.js): the history, saved and restored exactly
+/** In a saved patch: "the anchor's picture" (which changes in place, so the checkpoint keeps its own copy) */
+const SAVED_ANCHOR = Symbol("saved anchor");
+const NODE_LINK_KEYS = new Set(["parent", "futures", "image_data"]);
+/**
+ * A record of one history step for a checkpoint. Records are immutable and reused by the next checkpoint while the
+ * step doesn't change; pixel data (patches, selections) is shared with the live history (it's never modified in
+ * place, except the anchor's picture: see SAVED_ANCHOR).
+ * @param {HistoryNode} node
+ * @param {any} previous - this step's record in the previous checkpoint, if any
+ */
+function history_record_of(node, previous, registered) {
+	const anchor_image = history_anchor && history_anchor.image;
+	let patch = node.patch;
+	if (patch && anchor_image && (patch.before === anchor_image || patch.after === anchor_image)) {
+		patch = { ...patch, before: patch.before === anchor_image ? SAVED_ANCHOR : patch.before, after: patch.after === anchor_image ? SAVED_ANCHOR : patch.after };
+	}
+	const parent = node.parent ? node.parent.id : 0;
+	if (previous && previous.registered === registered && previous.parent === parent && previous.futures.length === node.futures.length &&
+		node.futures.every((child, i) => child.id === previous.futures[i]) &&
+		(previous.patch === patch || (patch && previous.patch && previous.patch.aliased && patch.before === previous.patch.before && patch.after === previous.patch.after && patch.x === previous.patch.x && patch.y === previous.patch.y && patch.full === previous.patch.full))) {
+		let same = true;
+		for (const key of Object.keys(node)) {
+			if (!NODE_LINK_KEYS.has(key) && key !== "patch" && previous.fields[key] !== node[key]) {
+				same = false;
+				break;
+			}
+		}
+		if (same) return previous;
+	}
+	const fields = {};
+	for (const key of Object.keys(node)) {
+		if (!NODE_LINK_KEYS.has(key) && key !== "patch") fields[key] = node[key];
+	}
+	if (patch !== node.patch) patch.aliased = true;
+	return Object.freeze({ id: node.id, registered, parent, futures: node.futures.map((child) => child.id), patch, fields });
+}
+/** The pixel data the live history holds (so checkpoints count only what they alone keep alive) */
+window.P95.history_pixels = () => {
+	const set = new Set();
+	for (const node of history_nodes_by_id.values()) {
+		if (node.patch) {
+			if (node.patch.before) set.add(node.patch.before);
+			if (node.patch.after) set.add(node.patch.after);
+		}
+		if (node.selection_image_data) set.add(node.selection_image_data);
+	}
+	return set;
+};
+/**
+ * Saves the whole history (for a replay checkpoint).
+ * @param {any} previous - the previous checkpoint's saved history (records are shared with it where unchanged)
+ * @returns {any} (anchor_image is the live anchor's picture: the caller copies it right away)
+ */
+window.P95.history_save = (previous) => {
+	const previous_records = previous ? previous.records_by_id : new Map();
+	const records = [];
+	const records_by_id = new Map();
+	/** @type {HistoryNode[]} steps linked from the history but no longer in it (e.g. undos of trimmed branches) */
+	const strays = [];
+	const save = (node, registered) => {
+		const record = history_record_of(node, previous_records.get(node.id), registered);
+		records.push(record);
+		records_by_id.set(node.id, record);
+	};
+	for (const node of history_nodes_by_id.values()) {
+		save(node, true);
+	}
+	const reach = (node) => {
+		if (node && !records_by_id.has(node.id)) {
+			records_by_id.set(node.id, null);
+			strays.push(node);
+		}
+	};
+	const reach_links = (node) => {
+		reach(node.parent);
+		node.futures.forEach(reach);
+	};
+	for (const node of history_nodes_by_id.values()) reach_links(node);
+	[root_history_node, current_history_node, history_node_to_cancel_to, history_anchor && history_anchor.node, ...undos, ...redos].forEach(reach);
+	for (let i = 0; i < strays.length; i++) {
+		save(strays[i], false);
+		reach_links(strays[i]);
+	}
+	const id_of = (node) => (node ? node.id : 0);
+	return {
+		records,
+		records_by_id,
+		root: id_of(root_history_node),
+		current: id_of(current_history_node),
+		cancel_to: id_of(history_node_to_cancel_to),
+		undos: undos.map(id_of),
+		redos: redos.map(id_of),
+		anchor: history_anchor ? history_anchor.node.id : 0,
+		anchor_image: history_anchor ? history_anchor.image : null,
+		dirty: { full: history_dirty.full, rect: history_dirty.rect && { ...history_dirty.rect } },
+		counter: history_node_counter,
+		bytes_total: history_bytes_total,
+	};
+};
+/**
+ * Restores a saved history exactly (step ids, patches, the anchor and the dirty rectangle, the memory count).
+ * @param {any} saved - from P95.history_save
+ * @param {ImageData | null} anchor_image - a fresh copy of saved.anchor_image's pixels
+ */
+window.P95.history_restore = (saved, anchor_image) => {
+	history_nodes_by_id.clear();
+	/** @type {Map<number, HistoryNode>} */
+	const nodes = new Map();
+	for (const record of saved.records) {
+		const node = { id: record.id, parent: null, futures: [], ...record.fields };
+		let patch = record.patch;
+		if (patch && patch.aliased) {
+			patch = { x: patch.x, y: patch.y, full: patch.full, before: patch.before === SAVED_ANCHOR ? anchor_image : patch.before, after: patch.after === SAVED_ANCHOR ? anchor_image : patch.after };
+		}
+		node.patch = patch;
+		Object.defineProperty(node, "image_data", {
+			enumerable: true,
+			get: () => history_image_of(node),
+			set: (value) => {
+				if (value) {
+					set_history_image(node, value);
+				}
+			},
+		});
+		nodes.set(record.id, node);
+		if (record.registered) {
+			history_nodes_by_id.set(record.id, node);
+		}
+	}
+	const node_of = (id) => {
+		if (!id) return null;
+		if (!nodes.has(id)) {
+			throw new Error(`checkpoint: history step ${id} isn't saved`);
+		}
+		return nodes.get(id);
+	};
+	for (const record of saved.records) {
+		const node = nodes.get(record.id);
+		node.parent = node_of(record.parent);
+		node.futures = record.futures.map(node_of);
+	}
+	root_history_node = node_of(saved.root);
+	current_history_node = node_of(saved.current);
+	history_node_to_cancel_to = saved.cancel_to ? node_of(saved.cancel_to) : null;
+	undos = saved.undos.map(node_of);
+	redos = saved.redos.map(node_of);
+	history_anchor = saved.anchor ? { node: node_of(saved.anchor), image: anchor_image } : null;
+	history_dirty.full = saved.dirty.full;
+	history_dirty.rect = saved.dirty.rect && { ...saved.dirty.rect };
+	history_node_counter = saved.counter;
+	history_bytes_total = saved.bytes_total;
+	$G.triggerHandler("history-update");
+};
+// #endregion
 window.P95.reset_history_keeping_canvas = () => {
 	undos.length = 0;
 	redos.length = 0;

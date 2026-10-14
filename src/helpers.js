@@ -258,6 +258,10 @@ function track_canvas_bounds(canvas, ctx) {
 	let canvas_width = canvas.width;
 	let canvas_height = canvas.height;
 	Object.defineProperty(canvas, "content_bounds", { configurable: true, get: () => bounds });
+	/** Replay checkpoints: puts back saved bounds (after restoring the pixels; doesn't count as drawing) */
+	canvas.set_content_bounds = (b) => {
+		bounds = b ? { ...b } : null;
+	};
 	// Many small drawing calls inside a known rectangle: account for the rectangle once, skip per-call tracking.
 	let bulk = false;
 	canvas.bulk_draw = (rect, fn) => {
