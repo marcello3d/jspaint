@@ -5,6 +5,7 @@
 
 import { cancel, deselect, get_tool_by_id, render_canvas_view, reset_canvas_and_history, reset_selected_colors, select_tools, set_magnification, update_canvas_rect } from "./functions.js";
 import { $G, make_canvas } from "./helpers.js";
+import { CheckpointStore } from "./paint95-checkpoint.js";
 import { load_picture_image_data } from "./paint95-fetch.js";
 import { decode_p95, decode_png, hash_image_data } from "./paint95-format.js";
 
@@ -61,6 +62,47 @@ export class ReplayController {
 		this.done = false;
 		/** bumped for every processed event, so the player can skip redrawing an unchanged frame */
 		this.version = 0;
+		/** replay work so far (ms, as measured while first replaying each part; checkpoints keep it) */
+		this.work = 0;
+		/** @type {CheckpointStore | null} in-memory checkpoints for seeking (enable_checkpoints) */
+		this.checkpoints = null;
+	}
+
+	/**
+	 * Keeps in-memory checkpoints while replaying, so seek() can go back without replaying from the start.
+	 * @param {object} [options]
+	 * @param {number} [options.memory] - bytes they may use (default 64 MB)
+	 * @param {number} [options.interval] - replay work (ms) between checkpoints (default 250)
+	 */
+	enable_checkpoints({ memory = 64 * 1024 * 1024, interval = 250 } = {}) {
+		this.checkpoints = new CheckpointStore({ memory, interval });
+	}
+
+	/**
+	 * Gets ready to advance_to(time): restores the latest checkpoint at or before it when the replay is already past
+	 * it, or when that checkpoint is far enough ahead to be quicker than replaying there.
+	 * @param {number} time
+	 * @returns {boolean} false if it's past the time with no checkpoint to go back to (replay from the start instead)
+	 */
+	seek(time) {
+		const past = this.position > 0 && this.timeline[this.position - 1].t > time;
+		const store = this.checkpoints;
+		const checkpoint = store && !store.disabled ? store.best_for(time) : null;
+		if (past && !checkpoint) {
+			return false;
+		}
+		if (checkpoint && (past || (checkpoint.position > this.position && checkpoint.work - this.work > 2 * store.restore_ms))) {
+			try {
+				store.restore(this, checkpoint);
+			} catch (error) {
+				console.error("[replay] couldn't restore a checkpoint", error);
+				store.disabled = true;
+				store.list = [];
+				return !past;
+			}
+			this.version++;
+		}
+		return true;
 	}
 
 	/**
@@ -143,6 +185,7 @@ export class ReplayController {
 	 */
 	advance_to(time, budget_ms = Infinity) {
 		const start = performance.now();
+		let last = start;
 		while (this.position < this.timeline.length && this.timeline[this.position].t <= time) {
 			const entry = this.timeline[this.position++];
 			this.version++;
@@ -155,7 +198,14 @@ export class ReplayController {
 				window.P95.in_dispatch = false;
 				window.P95.event_time = null;
 			}
-			if (performance.now() - start > budget_ms) {
+			let now = performance.now();
+			this.work += now - last;
+			if (this.checkpoints) {
+				this.checkpoints.maybe_take(this);
+				now = performance.now();
+			}
+			last = now;
+			if (now - start > budget_ms) {
 				break;
 			}
 		}
