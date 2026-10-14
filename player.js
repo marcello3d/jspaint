@@ -1,12 +1,14 @@
 // JSPaint.exe animation player (classic script; no modules needed by the host page).
 //
 //   new Paint95Player({ domRoot, lsaUrl /* .p95 URL */, finalImageUrl? /* the entry's picture, for the end snap if the
-//     replay drifts */, width?, height?, autoplay?, speed?, controls?, fit?: "box" | "contain", onTimeUpdate?, onError?, onEnd?, onDrift? })
+//     replay drifts */, width?, height?, autoplay?, speed?, controls?, fit?: "box" | "contain", checkpointMemory? /* bytes,
+//     default Paint95Player.defaultCheckpointMemory() */, onTimeUpdate?, onError?, onEnd?, onDrift? })
 //   members: ready (Promise), duration (ms), currentTime (ms), isPlaying, seeking, play(), pause(), seek(ms),
 //   setSpeed(multiplier 0.5..64; 64 = the strip's "max"), destroy()
 //
 // It replays the recorded input in the same engine: a hidden same-origin iframe of index.html?replay=1
-// (next to this script) runs the drawing, and this copies its canvas into a <canvas> in domRoot.
+// (next to this script) runs the drawing, and this copies its canvas into a <canvas> in domRoot. Seeking restores the
+// nearest in-memory checkpoint of the replay (src/paint95-checkpoint.js) and replays from there.
 // See docs/2draw-animation-format.md
 (function () {
 	"use strict";
@@ -18,6 +20,21 @@
 
 	function clamp(value, min, max) {
 		return Math.max(min, Math.min(max, value));
+	}
+
+	var MB = 1024 * 1024;
+	/**
+	 * Memory for seeking checkpoints on this device: 16 MB per GB of navigator.deviceMemory, at most 128 MB; without
+	 * it, 32 MB on phones and 64 MB otherwise. (They come on top of the replay engine itself, and phone browsers close
+	 * tabs that use much more than a few hundred MB.)
+	 */
+	function defaultCheckpointMemory() {
+		var device_memory = typeof navigator !== "undefined" && navigator.deviceMemory;
+		if (device_memory > 0) {
+			return clamp(device_memory * 16 * MB, 4 * MB, 128 * MB);
+		}
+		var phone = typeof screen !== "undefined" && Math.min(screen.width, screen.height) < 600;
+		return phone ? 32 * MB : 64 * MB;
 	}
 
 	function Paint95Player(options) {
@@ -39,6 +56,7 @@
 		self._restarting = null;
 		self._ended = false;
 		self._seeking = false;
+		self._seek_pending = false;
 
 		var root = self._options.domRoot;
 		if (!root) {
@@ -103,7 +121,6 @@
 				self._advance(Infinity);
 				self._render();
 				self._emit_time();
-				self._prepare_spare();
 				if (self._options.autoplay) {
 					self.play();
 				}
@@ -157,7 +174,11 @@
 		self._duration = frame.info.duration;
 		self._width = frame.info.width;
 		self._height = frame.info.height;
-		self._processed = -1;
+		self._seek_pending = false;
+		if (self._controller.enable_checkpoints) {
+			var memory = self._options.checkpointMemory;
+			self._controller.enable_checkpoints({ memory: memory == null ? defaultCheckpointMemory() : memory });
+		}
 		self._controller.ondrift = function (drift) {
 			if (self._options.onDrift) {
 				try { self._options.onDrift(drift); } catch (error) { console.error(error); }
@@ -172,9 +193,40 @@
 			return;
 		}
 		this._caught_up = this._controller.advance_to(this._time, budget === undefined ? FRAME_BUDGET_MS : budget);
-		if (this._caught_up) {
-			this._processed = this._time;
+	};
+
+	/** Gets the engine ready to replay to the seek's time: restores a checkpoint, or starts over in a fresh engine. */
+	Paint95Player.prototype._apply_seek = function () {
+		this._seek_pending = false;
+		var ok = this._controller.seek ? this._controller.seek(this._time) : false;
+		if (!ok) {
+			this._restart();
 		}
+	};
+
+	/** Replays from the start in a fresh engine (only one at a time; seeks meanwhile just move the target). */
+	Paint95Player.prototype._restart = function () {
+		var self = this;
+		if (self._restarting) {
+			return;
+		}
+		var restart = self._create_frame().then(function (frame) {
+			if (self._destroyed || self._restarting !== restart) {
+				frame.iframe.remove();
+				return;
+			}
+			self._restarting = null;
+			self._install(frame);
+			self._caught_up = false;
+			self._schedule();
+		}, function (error) {
+			self._restarting = null;
+			self._seeking = false;
+			if (self._options.onError) {
+				self._options.onError(error);
+			}
+		});
+		self._restarting = restart;
 	};
 
 	Paint95Player.prototype._schedule = function () {
@@ -192,6 +244,9 @@
 			self._last_tick = now;
 			if (self._playing && !self._restarting && self._caught_up) {
 				self._time = Math.min(self._duration, self._time + dt * self._speed);
+			}
+			if (!self._restarting && self._seek_pending) {
+				self._apply_seek();
 			}
 			if (!self._restarting) {
 				self._advance();
@@ -253,56 +308,12 @@
 		}
 		ms = clamp(Number(ms) || 0, 0, self._duration);
 		self._seeking = true;
-		var going_back = ms < self._time || (self._processed > ms);
 		self._time = ms;
-		if (going_back && self._controller) {
-			// Replay from the start (fast) in a fresh engine: the spare one loaded in the background, if it's there.
-			var next = self._spare || self._create_frame();
-			next.claimed = true;
-			self._spare = null;
-			var restart = next.then(function (frame) {
-				if (self._restarting !== restart) {
-					frame.iframe.remove();
-					return;
-				}
-				self._restarting = null;
-				self._install(frame);
-				self._caught_up = false;
-				self._schedule();
-				self._prepare_spare();
-			}, function (error) {
-				self._restarting = null;
-				self._seeking = false;
-				if (self._options.onError) {
-					self._options.onError(error);
-				}
-			});
-			self._restarting = restart;
-		} else {
-			self._caught_up = false;
-		}
+		// (applied on the next frame, so a burst of seeks while dragging costs one)
+		self._seek_pending = true;
+		self._caught_up = false;
 		self._emit_time();
 		self._schedule();
-	};
-
-	/** Loads a second engine in the background (at the start), so seeking backwards doesn't wait for one to load. */
-	Paint95Player.prototype._prepare_spare = function () {
-		var self = this;
-		if (self._spare || self._destroyed) {
-			return;
-		}
-		var spare = self._create_frame();
-		self._spare = spare;
-		spare.then(function (frame) {
-			// (a spare that seek() took is installed there)
-			if (self._destroyed || (!spare.claimed && self._spare !== spare)) {
-				frame.iframe.remove();
-			}
-		}, function () {
-			if (self._spare === spare) {
-				self._spare = null;
-			}
-		});
 	};
 
 	Paint95Player.prototype.setSpeed = function (multiplier) {
@@ -320,10 +331,6 @@
 		}
 		if (this._frame) {
 			this._frame.iframe.remove();
-		}
-		if (this._spare) {
-			this._spare.then(function (frame) { frame.iframe.remove(); }, function () { });
-			this._spare = null;
 		}
 		this._container.remove();
 	};
@@ -444,5 +451,6 @@
 		}
 	};
 
+	Paint95Player.defaultCheckpointMemory = defaultCheckpointMemory;
 	window.Paint95Player = Paint95Player;
 })();
