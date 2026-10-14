@@ -1227,6 +1227,59 @@ async function test_references() {
 	check(same, "references: after drifting, the end shows the final picture from finalImageUrl");
 }
 
+/**
+ * Seeking backwards shows no catch-up frames: the output canvas keeps the last frame until the target frame is drawn,
+ * and `seeking` goes true, then false with an onTimeUpdate (anim-strip.ts holds the frame on it).
+ */
+async function test_seek_hold(recording) {
+	if (!recording) return;
+	const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+	watch(page, "seekhold");
+	await page.route(`${base}/__test_host.html`, (route) => route.fulfill({
+		contentType: "text/html",
+		body: `<!doctype html><meta charset="utf-8"><body style="margin:0"><div id="root" style="width:320px;height:240px"></div><script src="player.js"></script>`,
+	}));
+	await page.goto(`${base}/__test_host.html`, { waitUntil: "load" });
+	const result = await page.evaluate(async (base64) => {
+		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+		const updates = [];
+		const player = new window.Paint95Player({
+			domRoot: document.getElementById("root"),
+			lsaUrl: URL.createObjectURL(new Blob([bytes])),
+			onTimeUpdate: (info) => updates.push({ seeking: info.seeking, time: info.currentTime }),
+		});
+		await player.ready;
+		const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+		player.seek(player.duration);
+		while (player.seeking) await frame();
+		// count paints of the output canvas during the backward seek
+		let paints = 0;
+		let paints_while_seeking = 0;
+		const draw = player._ctx.drawImage.bind(player._ctx);
+		player._ctx.drawImage = (...args) => {
+			paints++;
+			if (player.seeking && args[0] === player._controller.get_frame().canvas) paints_while_seeking++;
+			return draw(...args);
+		};
+		updates.length = 0;
+		player.seek(player.duration / 2);
+		const seeking_right_after = player.seeking;
+		while (player.seeking) await frame();
+		await frame();
+		return {
+			seeking_right_after,
+			seeking_after: player.seeking,
+			paints, paints_while_seeking,
+			cleared_update: updates.some((u) => u.seeking === true) && updates.length > 0 && updates[updates.length - 1].seeking === false,
+			speeds: [0.5, 1, 2, 4, 8, 16, 64, 1000, 0].map((x) => { player.setSpeed(x); return player._speed; }),
+		};
+	}, recording.base64);
+	await page.close();
+	check(result.seeking_right_after && !result.seeking_after && result.cleared_update, `seekhold: seeking goes true on seek() and false (with an onTimeUpdate) when the target is drawn (${JSON.stringify(result)})`);
+	check(result.paints_while_seeking === 0 && result.paints > 0, `seekhold: no catch-up frames are painted during a backward seek (${result.paints_while_seeking} while seeking, ${result.paints} paints in all)`);
+	check(result.speeds.join() === "0.5,1,2,4,8,16,64,64,1", `seekhold: the strip's speeds (0.5…16, max = 64) are accepted (${result.speeds})`);
+}
+
 const recordings = {};
 
 try {
@@ -1263,6 +1316,10 @@ try {
 	}
 	if (wanted("timing")) {
 		await test_playback_timing();
+	}
+	if (wanted("seekhold")) {
+		// (a longer log, so the catch-up after a backward seek takes several frames)
+		await test_seek_hold({ base64: fs.readFileSync(path.join(repo_root, "scripts", "fixtures", "typical-v2.p95")).toString("base64") });
 	}
 	if (wanted("fonts")) {
 		await test_no_font_permission(recordings.all_tools);

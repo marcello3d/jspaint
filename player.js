@@ -2,7 +2,8 @@
 //
 //   new Paint95Player({ domRoot, lsaUrl /* .p95 URL */, finalImageUrl? /* the entry's picture, for the end snap if the
 //     replay drifts */, width?, height?, autoplay?, speed?, controls?, fit?: "box" | "contain", onTimeUpdate?, onError?, onEnd?, onDrift? })
-//   members: ready (Promise), duration (ms), currentTime (ms), isPlaying, play(), pause(), seek(ms), setSpeed(multiplier), destroy()
+//   members: ready (Promise), duration (ms), currentTime (ms), isPlaying, seeking, play(), pause(), seek(ms),
+//   setSpeed(multiplier 0.5..64; 64 = the strip's "max"), destroy()
 //
 // It replays the recorded input in the same engine: a hidden same-origin iframe of index.html?replay=1
 // (next to this script) runs the drawing, and this copies its canvas into a <canvas> in domRoot.
@@ -37,6 +38,7 @@
 		self._last_tick = 0;
 		self._restarting = null;
 		self._ended = false;
+		self._seeking = false;
 
 		var root = self._options.domRoot;
 		if (!root) {
@@ -79,6 +81,8 @@
 		duration: { get: function () { return this._duration; } },
 		currentTime: { get: function () { return this._time; } },
 		isPlaying: { get: function () { return this._playing; } },
+		/** true from seek() until the target frame is drawn (catch-up frames aren't drawn meanwhile) */
+		seeking: { get: function () { return this._seeking; } },
 	});
 
 	Paint95Player.prototype._init = function () {
@@ -191,7 +195,17 @@
 			}
 			if (!self._restarting) {
 				self._advance();
-				self._render();
+				// while seeking, keep the last frame until the target is reached
+				var landed = self._seeking && self._caught_up;
+				if (landed) {
+					self._seeking = false;
+				}
+				if (!self._seeking) {
+					self._render();
+				}
+				if (landed) {
+					self._emit_time();
+				}
 			}
 			if (self._playing) {
 				self._emit_time();
@@ -238,6 +252,7 @@
 			return;
 		}
 		ms = clamp(Number(ms) || 0, 0, self._duration);
+		self._seeking = true;
 		var going_back = ms < self._time || (self._processed > ms);
 		self._time = ms;
 		if (going_back && self._controller) {
@@ -257,6 +272,7 @@
 				self._prepare_spare();
 			}, function (error) {
 				self._restarting = null;
+				self._seeking = false;
 				if (self._options.onError) {
 					self._options.onError(error);
 				}
@@ -320,6 +336,7 @@
 				duration: this._duration,
 				isPlaying: this._playing,
 				progress: this._duration ? this._time / this._duration : 0,
+				seeking: this._seeking,
 			});
 		}
 	};
