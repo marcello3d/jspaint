@@ -52,6 +52,8 @@
 		depth: 0,
 		/** true while a recorded canvas pointer event (or airbrush tick) is being dispatched */
 		in_dispatch: false,
+		/** true while tools paint on pointermove (canvas_pointer_move): the recorder then stores each coalesced sample */
+		painting_moves: false,
 		/** time (ms) of the event being dispatched, if any (recording: recorded time; replay: replayed time) */
 		event_time: null,
 		/** @type {() => number} */

@@ -10,6 +10,7 @@
 //       ready?(): void,                            // called once the app has loaded
 //     }
 //   Without a host (standalone, or cross-origin parent), Submit downloads the PNG instead.
+//   The app exposes window.paint95History = { canUndo(), canRedo(), onChange(cb) => unsubscribe } on its own window.
 //   &anim=<url of a previous .p95> continues that recording (see docs/2draw-animation-format.md).
 //   In replay mode (index.html?replay=1, used by player.js) none of this runs.
 
@@ -52,6 +53,40 @@ function init_editor() {
 
 	/** @type {Recorder | null} */
 	let recorder = null;
+
+	// #region History API (for the parent page, e.g. the iOS app's squeeze palette dimming undo/redo)
+
+	/** @type {Set<() => void>} */
+	const history_listeners = new Set();
+	/**
+	 * window.paint95History = {
+	 *   canUndo(): boolean,                 // there's a step to undo
+	 *   canRedo(): boolean,                 // there's a step to redo
+	 *   onChange(cb: () => void): () => void, // cb after each history change (new step, undo, redo, load); returns an unsubscribe function
+	 * }
+	 */
+	Object.defineProperty(window, "paint95History", {
+		value: Object.freeze({
+			canUndo: () => undos.length > 0,
+			canRedo: () => redos.length > 0,
+			/** @param {() => void} cb */
+			onChange(cb) {
+				history_listeners.add(cb);
+				return () => { history_listeners.delete(cb); };
+			},
+		}),
+	});
+	$G.on("history-update", () => {
+		for (const cb of [...history_listeners]) {
+			try {
+				cb();
+			} catch (error) {
+				console.error("paint95History listener failed", error);
+			}
+		}
+	});
+
+	// #endregion
 
 	// #region Submit button (right end of the menu bar)
 

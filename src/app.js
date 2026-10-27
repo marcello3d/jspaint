@@ -10,7 +10,7 @@ import { Handles } from "./Handles.js";
 import { default_palette, get_winter_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
 import { cancel, change_some_url_params, change_url_param, clear, confirm_overwrite_capability, delete_selection, deselect, edit_copy, edit_cut, edit_paste, file_new, file_save, get_tool_by_id, get_uris, image_flip_and_rotate, image_invert_colors, install_history_dirty_tracking, image_stretch_and_skew, load_image_from_uri, make_or_update_undoable, open_from_file, paste, paste_image_from_file, redo, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, save_as_prompt, select_all, select_tool, select_tools, set_magnification, show_document_history, show_error_message, show_resource_load_error_message, toggle_grid, undo, update_canvas_rect, update_disable_aa, update_helper_layer, update_magnified_canvas_size, view_bitmap, write_image_file } from "./functions.js";
-import { $G, E, TAU, get_file_extension, get_help_folder_icon, is_discord_embed, make_canvas, to_canvas_coords } from "./helpers.js";
+import { $G, E, TAU, coalesced_pointer_samples, get_file_extension, get_help_folder_icon, is_discord_embed, make_canvas, to_canvas_coords } from "./helpers.js";
 import { init_webgl_stuff, rotate } from "./image-manipulation.js";
 import { menus } from "./menus.js";
 import { showMessageBox } from "./msgbox.js";
@@ -1224,10 +1224,30 @@ function tool_go(selected_tool, event_name) {
 		selected_tool.paint(main_ctx, pointer.x, pointer.y);
 	}
 }
+// 2draw: tools paint through every coalesced sample of a move, in order, so fast curves stay round. The recorder stores
+// each sample as its own move, so a replay (whose events have no coalesced samples) paints the same steps.
+// Buttons and modifier keys come from the event itself; only the position comes from the sample.
 function canvas_pointer_move(e) {
+	const samples = coalesced_pointer_samples(e);
+	if (!samples) {
+		canvas_pointer_move_to(e, e);
+		return;
+	}
+	for (const sample of samples) {
+		if (!canvas_pointer_move_to(e, sample)) {
+			break;
+		}
+	}
+}
+/**
+ * @param {JQuery.TriggeredEvent | PointerEvent} e - the pointermove
+ * @param {{ clientX: number, clientY: number }} sample - where (the event itself or one of its coalesced samples)
+ * @returns {boolean} false if the move canceled the stroke
+ */
+function canvas_pointer_move_to(e, sample) {
 	ctrl = e.ctrlKey;
 	shift = e.shiftKey;
-	pointer = to_canvas_coords(e);
+	pointer = to_canvas_coords(sample);
 
 	// Quick Undo (for mouse/pen)
 	// (Note: pointermove also occurs when the set of buttons pressed changes,
@@ -1238,7 +1258,7 @@ function canvas_pointer_move(e) {
 		if (e.pointerType != pointer_type || (e.buttons | MMB) != (pointer_buttons | MMB)) {
 			cancel();
 			pointer_active = false; // NOTE: pointer_active used in cancel()
-			return;
+			return false;
 		}
 	}
 
@@ -1282,6 +1302,7 @@ function canvas_pointer_move(e) {
 		tool_go(selected_tool);
 	});
 	pointer_previous = pointer;
+	return true;
 }
 $canvas.on("pointermove", (e) => {
 	pointer = to_canvas_coords(e);
@@ -1499,6 +1520,7 @@ $canvas.on("pointerdown", (e) => {
 		});
 
 		$G.on("pointermove", canvas_pointer_move);
+		window.P95.painting_moves = true;
 
 		$G.one("pointerup", (e, canceling, no_undoable) => {
 			button = undefined;
@@ -1521,6 +1543,7 @@ $canvas.on("pointerdown", (e) => {
 				}
 			}
 			$G.off("pointermove", canvas_pointer_move);
+			window.P95.painting_moves = false;
 			for (const interval_id of interval_ids) {
 				clearInterval(interval_id);
 			}

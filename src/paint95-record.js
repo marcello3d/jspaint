@@ -3,7 +3,7 @@
 // JSPaint.exe: records the drawing session as input events (see docs/2draw-animation-format.md).
 
 import { update_canvas_rect } from "./functions.js";
-import { make_canvas } from "./helpers.js";
+import { coalesced_pointer_samples, make_canvas } from "./helpers.js";
 import { FORMAT_VERSION, encode_p95, encode_png, hash_image_data } from "./paint95-format.js";
 import { tools } from "./tools.js";
 
@@ -319,12 +319,20 @@ export class Recorder {
 				this.push(t, "d", id, target, x, y, e.button, e.buttons, mods, POINTER_TYPES[e.pointerType] ?? 0, pressure, e.isPrimary ? 1 : 0);
 				this.last_move_fields.delete(id);
 			} else if (e.type === "pointermove") {
-				const fields = `${e.button},${e.buttons},${mods},${pressure}`;
-				if (this.last_move_fields.get(id) === fields) {
-					this.push(t, "m", id, x, y);
-				} else {
-					this.push(t, "M", id, x, y, e.button, e.buttons, mods, pressure);
-					this.last_move_fields.set(id, fields);
+				// While tools paint, one move per coalesced sample, as the app paints them (see canvas_pointer_move), with
+				// the event's own buttons and modifiers; the last sample is the event's own position. Other moves
+				// (dragging a selection, two-finger pan) only ever use the event itself.
+				const samples = (window.P95.painting_moves && coalesced_pointer_samples(e)) || [e];
+				for (const sample of samples) {
+					const [sx, sy] = this.canvas_coords(sample);
+					const sample_pressure = Math.round((sample.pressure || 0) * 255);
+					const fields = `${e.button},${e.buttons},${mods},${sample_pressure}`;
+					if (this.last_move_fields.get(id) === fields) {
+						this.push(t, "m", id, sx, sy);
+					} else {
+						this.push(t, "M", id, sx, sy, e.button, e.buttons, mods, sample_pressure);
+						this.last_move_fields.set(id, fields);
+					}
 				}
 			} else if (e.type === "pointerup") {
 				this.push(t, "u", id, x, y, e.button, e.buttons, mods);

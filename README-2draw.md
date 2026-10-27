@@ -37,12 +37,22 @@ window.paint95Host = {
 
 Without a host (standalone), Submit downloads the PNG.
 
+The app's own window exposes the undo history, for a same-origin parent (e.g. to dim undo/redo buttons):
+
+```js
+const h = iframe.contentWindow.paint95History;
+h.canUndo(); h.canRedo();          // booleans
+const off = h.onChange(() => {});  // called after each history change (new step, undo, redo, load)
+```
+
 - `anim` (optional): URL of the previous `.p95` when editing an existing drawing; the new recording continues it.
 
 ## Animations
 
 The editor records the drawing as input (pointer events in canvas pixels, tool changes, commands) and the player replays it
 in the same engine. Format and determinism notes: [docs/2draw-animation-format.md](docs/2draw-animation-format.md).
+While a tool paints, every coalesced sample of a pointermove (`getCoalescedEvents()`, e.g. ~4 per frame from an
+Apple Pencil) is painted and recorded as its own move, so replays (which have no coalesced samples) paint the same steps.
 
 ```html
 <script src="/applet/paint95/player.js"></script>

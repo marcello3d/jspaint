@@ -644,6 +644,22 @@ function to_canvas_coords({ clientX, clientY }) {
 	};
 }
 /**
+ * 2draw: the coalesced samples of a pointermove (oldest first; the last one is the event's own position), or null when
+ * the browser has none beyond the event itself (or it's a synthetic/replayed event). Browsers deliver one pointermove
+ * per frame and keep the samples in between here: an Apple Pencil gives about four per frame on iPad.
+ * Predicted events are not used.
+ * @param {Event | JQuery.Event} event - DOM or jQuery event
+ * @returns {PointerEvent[] | null}
+ */
+function coalesced_pointer_samples(event) {
+	const original = /** @type {any} */ (event).originalEvent || event;
+	if (original.type !== "pointermove" || typeof original.getCoalescedEvents !== "function") {
+		return null;
+	}
+	const samples = original.getCoalescedEvents();
+	return samples && samples.length > 1 ? samples : null;
+}
+/**
  * @param {{ x: number, y: number }} canvas_point
  * @returns {{ clientX: number, clientY: number }} client coordinates
  */
@@ -687,6 +703,7 @@ function supports_vertical_writing_mode() {
 
 
 export {
+	coalesced_pointer_samples,
 	load_script,
 	$G,
 	E,
