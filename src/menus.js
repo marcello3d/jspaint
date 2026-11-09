@@ -147,14 +147,7 @@ const menus = {
 			action: () => { save_selection_to_file(); },
 			description: localize("Copies the selection to a file."),
 		},
-		{
-			label: `${localize("Paste &From")}...`,
-			speech_recognition: [
-				"paste a file", "paste from a file", "insert a file", "insert an image file",
-			],
-			action: () => { choose_file_to_paste(); },
-			description: localize("Pastes a file into the selection."),
-		},
+		// 2draw: no "Paste From..." (no pictures from outside the app; see paste_image_from_file)
 	],
 	[localize("&View")]: [
 		{

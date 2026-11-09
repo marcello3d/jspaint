@@ -2143,27 +2143,40 @@ function show_news() {
 
 // @TODO: DRY between these functions and open_from_* functions further?
 
-/**
- * @param {Blob} blob
- */
-function paste_image_from_file(blob) {
-	read_image_file(blob, (error, info) => {
-		if (error) {
-			show_file_format_errors({ as_image_error: error });
-			return;
-		}
-		paste(info.image || make_canvas(info.image_data));
-	});
+// 2draw: drawings on 2draw are drawn here, so no picture comes in from outside the app: not from a file, a drop, or
+// the system clipboard. Copy, Cut and Paste of a selection still work, through internal_clipboard below (Copy also
+// still puts the selection on the system clipboard, which takes nothing in).
+const outside_image_message = "Pictures from outside JSPaint can't be pasted or opened on 2draw. Draw it here instead!";
+
+/** @type {HTMLCanvasElement | null} */
+let internal_clipboard = null;
+
+/** Keeps a copy of the current selection for Paste. */
+function remember_selection_for_paste() {
+	if (selection && selection.canvas) {
+		internal_clipboard = make_canvas(selection.canvas);
+	}
 }
 
-// Edit > Paste From
-async function choose_file_to_paste() {
-	const { file } = await systemHooks.showOpenFileDialog({ formats: image_formats });
-	if (file.type.match(/^image|application\/pdf/)) {
-		paste_image_from_file(file);
-		return;
+/** Pastes what was last copied or cut in this app; never what is on the system clipboard. */
+function paste_internal_clipboard() {
+	if (internal_clipboard) {
+		paste(make_canvas(internal_clipboard));
+	} else {
+		show_error_message(outside_image_message);
 	}
-	show_error_message(localize("This is not a valid bitmap file, or its format is not currently supported."));
+}
+
+/**
+ * @param {Blob} _blob
+ */
+function paste_image_from_file(_blob) {
+	show_error_message(outside_image_message);
+}
+
+// Edit > Paste From (removed from the menu)
+async function choose_file_to_paste() {
+	show_error_message(outside_image_message);
 }
 
 /**
@@ -3040,14 +3053,10 @@ function edit_copy(execCommandFallback) {
 		}
 		navigator.clipboard.writeText(text);
 	} else if (selection && selection.canvas) {
+		// 2draw: Paste uses this copy; the system clipboard copy below is a bonus and may fail quietly.
+		remember_selection_for_paste();
 		if (!navigator.clipboard || !navigator.clipboard.write) {
-			if (execCommandFallback) {
-				return try_exec_command("copy");
-			} else {
-				show_error_message(`${localize("Error getting the Clipboard Data!")} ${recommendationForClipboardAccess}`);
-				// show_error_message(`The Async Clipboard API is not supported by this browser. ${browserRecommendationForClipboardAccess}`);
-				return;
-			}
+			return;
 		}
 		selection.canvas.toBlob((blob) => {
 			sanity_check_blob(blob, () => {
@@ -3059,7 +3068,7 @@ function edit_copy(execCommandFallback) {
 				]).then(() => {
 					window.console?.log("Copied image to the clipboard.");
 				}, (error) => {
-					show_error_message("Failed to copy to the Clipboard.", error);
+					window.console?.warn("Failed to copy to the system clipboard.", error);
 				});
 			});
 		});
@@ -3069,16 +3078,8 @@ function edit_copy(execCommandFallback) {
  * @param {boolean} [execCommandFallback]
  */
 function edit_cut(execCommandFallback) {
-	if (!navigator.clipboard || !navigator.clipboard.write) {
-		if (execCommandFallback) {
-			return try_exec_command("cut");
-		} else {
-			show_error_message(`${localize("Error getting the Clipboard Data!")} ${recommendationForClipboardAccess}`);
-			// show_error_message(`The Async Clipboard API is not supported by this browser. ${browserRecommendationForClipboardAccess}`);
-			return;
-		}
-	}
-	edit_copy();
+	// 2draw: Cut keeps the selection in internal_clipboard (edit_copy), so it needs no clipboard API.
+	edit_copy(execCommandFallback);
 	delete_selection({
 		name: localize("Cut"),
 		icon: get_help_folder_icon("p_cut.png"),
@@ -3105,45 +3106,8 @@ async function edit_paste(execCommandFallback) {
 		document.execCommand("InsertText", false, clipboardText);
 		return;
 	}
-	if (!navigator.clipboard || !navigator.clipboard.read) {
-		if (execCommandFallback) {
-			return try_exec_command("paste");
-		} else {
-			show_error_message(`${localize("Error getting the Clipboard Data!")} ${recommendationForClipboardAccess}`);
-			// show_error_message(`The Async Clipboard API is not supported by this browser. ${browserRecommendationForClipboardAccess}`);
-			return;
-		}
-	}
-	try {
-		const clipboardItems = await navigator.clipboard.read();
-		const blob = await clipboardItems[0].getType("image/png");
-		paste_image_from_file(blob);
-	} catch (error) {
-		if (error.name === "NotFoundError") {
-			try {
-				const clipboardText = await navigator.clipboard.readText();
-				if (clipboardText) {
-					const uris = get_uris(clipboardText);
-					if (uris.length > 0) {
-						load_image_from_uri(uris[0]).then((info) => {
-							paste(info.image || make_canvas(info.image_data));
-						}, (error) => {
-							show_resource_load_error_message(error);
-						});
-					} else {
-						// @TODO: should I just make a textbox instead?
-						show_error_message("The information on the Clipboard can't be inserted into the picture.");
-					}
-				} else {
-					show_error_message("The information on the Clipboard can't be inserted into the picture.");
-				}
-			} catch (error) {
-				show_error_message(localize("Error getting the Clipboard Data!"), error);
-			}
-		} else {
-			show_error_message(localize("Error getting the Clipboard Data!"), error);
-		}
-	}
+	// 2draw: only what was copied or cut in this app.
+	paste_internal_clipboard();
 }
 
 // 2draw: recorded/replayed command (see paint95-core.js)
@@ -4689,7 +4653,7 @@ export {
 	apply_file_format_and_palette_info, are_you_sure, cancel, change_some_url_params, change_url_param, choose_file_to_paste, cleanup_bitmap_view, clear, confirm_overwrite_capability, delete_selection, deselect, detect_monochrome,
 	edit_copy, edit_cut, edit_paste, exit_fullscreen_if_ios, file_load_from_url, file_new, file_open, file_print, file_save,
 	file_save_as, getSelectionText, get_all_url_params, get_history_ancestors, get_tool_by_id, get_uris, get_url_param, go_to_history_node, handle_keyshortcuts, has_any_transparency, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, load_theme_from_text, make_history_node, make_monochrome_palette, make_monochrome_pattern, make_opaque, make_or_update_undoable, make_stripe_pattern, meld_selection_into_canvas,
-	meld_textbox_into_canvas, open_from_file, open_from_image_info, paste, paste_image_from_file, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,
+	meld_textbox_into_canvas, open_from_file, open_from_image_info, paste, paste_image_from_file, paste_internal_clipboard, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, remember_selection_for_paste, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,
 	toggle_thumbnail, try_exec_command, undo, undoable, update_canvas_rect, update_css_classes_for_conditional_messages, update_disable_aa, update_from_saved_file, update_helper_layer,
 	update_helper_layer_immediately, update_magnified_canvas_size, update_title, view_bitmap, write_image_file
 };
