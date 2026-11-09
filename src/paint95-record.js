@@ -110,6 +110,8 @@ export class Recorder {
 
 		const seed = crypto.getRandomValues(new Uint32Array(1))[0];
 		window.P95.seed(seed);
+		// A segment starts with an empty clipboard; its replay does the same (start_segment).
+		window.P95.clipboard = null;
 		/** @type {import("./paint95-format.js").P95Segment} */
 		this.segment = {
 			seed,
@@ -383,14 +385,8 @@ export class Recorder {
 		}
 		const t = this.begin_event();
 		if (name === "paste") {
-			// Store the image, and paste exactly what a replay will paste (normalized through ImageData).
-			const [img, x, y] = args;
-			const source = make_canvas(img);
-			const image_data = source.ctx.getImageData(0, 0, source.width, source.height);
-			const normalized = make_canvas(image_data.width, image_data.height);
-			normalized.ctx.putImageData(image_data, 0, 0);
-			this.push(t, "f", "paste", this.add_blob(image_data), x, y);
-			return [normalized, x, y];
+			// 2draw: a recording never stores a pasted picture (only copy_clip/paste_clip, which carry no pixels).
+			throw new Error("paste of an outside picture can't be recorded");
 		}
 		this.push(t, "f", name, ...args);
 	}

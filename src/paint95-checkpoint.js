@@ -278,6 +278,7 @@ export class CheckpointStore {
 			p95: {
 				random: window.P95.random.get_state(),
 				behavior: window.P95.behavior,
+				clipboard: window.P95.clipboard, // (never changed in place: Copy makes a new one)
 				required: [window.paint95_required_width, window.paint95_required_height],
 			},
 			controller: {
@@ -334,6 +335,7 @@ export class CheckpointStore {
 			bytes += 2048 + 8 * checkpoint.history.records.length + 64 * checkpoint.controller.consumed.length;
 			add_picture(checkpoint.canvas);
 			add_picture(checkpoint.anchor);
+			add_pixels(checkpoint.p95.clipboard);
 			for (const state of checkpoint.tools) {
 				for (const value of Object.values(state)) {
 					if (value && value.tool_canvas && value.pixels) bytes += value.pixels.data.byteLength;
@@ -468,6 +470,7 @@ export class CheckpointStore {
 		window.P95.random = window.P95.make_prng(0);
 		window.P95.random.set_state(checkpoint.p95.random);
 		window.P95.behavior = checkpoint.p95.behavior;
+		window.P95.clipboard = checkpoint.p95.clipboard;
 		[window.paint95_required_width, window.paint95_required_height] = checkpoint.p95.required;
 		window.P95.in_dispatch = false;
 		window.P95.event_time = null;

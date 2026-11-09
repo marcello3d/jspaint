@@ -284,7 +284,6 @@ function compare(label, recording, replay) {
 	check(same_size && diff === 0, `${label}: replayed canvas is pixel-identical (${replay.width}x${replay.height} vs ${recording.width}x${recording.height}, ${diff} differing bytes)`);
 }
 
-const test_png = make_test_png();
 
 const sessions = {
 	async all_tools(t) {
@@ -378,12 +377,12 @@ const sessions = {
 		await t.drag([[200, 60], [240, 70], [230, 110], [195, 100], [200, 60]]);
 		await t.drag([[215, 85], [180, 95]]);
 		await page.keyboard.press("Delete"); // clear selection
-		// paste an image (Edit > Paste From...)
-		const [chooser] = await Promise.all([
-			page.waitForEvent("filechooser"),
-			t.menu("Edit", "Paste From..."),
-		]);
-		await chooser.setFiles({ name: "paste.png", mimeType: "image/png", buffer: test_png });
+		// copy a drawn region and paste it (the internal clipboard; recorded as copy_clip/paste_clip, without pixels)
+		await t.tool("Select");
+		await t.drag([[20, 20], [90, 60]]);
+		await t.menu("Edit", "Copy");
+		await t.menu("Edit", "Paste");
+		await wait_until(page, () => !!selection);
 		await page.waitForTimeout(300);
 		await t.drag([[8, 8], [100, 30]]); // move the pasted selection (it's at the top left)
 		await t.tool("Pencil");
@@ -1039,43 +1038,35 @@ async function test_no_font_permission(recording_with_text) {
 }
 
 /**
- * Libraries for rarer formats (bmp.js, UTIF.js, AnyPalette, gif.js) load on first use: pasting a BMP works.
+ * 2draw: no picture comes in from outside the app. Libraries for rarer formats (bmp.js, UTIF.js, AnyPalette, gif.js)
+ * aren't loaded at startup; Edit > Paste From... is gone; a system-clipboard paste or a dropped image file pastes
+ * nothing; the recording holds no paste blob.
  */
 async function test_lazy_libraries() {
-	// a 4x2 24-bit BMP
-	const width = 4;
-	const height = 2;
-	const row = Math.ceil(width * 3 / 4) * 4;
-	const bmp = Buffer.alloc(54 + row * height);
-	bmp.write("BM", 0);
-	bmp.writeUInt32LE(bmp.length, 2);
-	bmp.writeUInt32LE(54, 10);
-	bmp.writeUInt32LE(40, 14);
-	bmp.writeInt32LE(width, 18);
-	bmp.writeInt32LE(height, 22);
-	bmp.writeUInt16LE(1, 26);
-	bmp.writeUInt16LE(24, 28);
-	bmp.writeUInt32LE(row * height, 34);
-	for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-		const o = 54 + y * row + x * 3;
-		bmp[o] = 255; bmp[o + 1] = x * 60; bmp[o + 2] = y * 200; // BGR
-	}
 	const page = await browser.newPage({ viewport: { width: 1024, height: 700 } });
-	watch(page, "lazy");
+	watch(page, "outside");
 	await page.goto(`${base}/index.html?w=100&h=80`);
 	await wait_until(page, () => !!(window.P95 && window.P95.recorder));
 	const before = await page.evaluate(() => [typeof window.decodeBMP, typeof window.AnyPalette, typeof window.GIF, typeof window.UTIF]);
 	await page.click(`.menus .menu-button:has-text("Edit")`);
-	const [chooser] = await Promise.all([
-		page.waitForEvent("filechooser"),
-		page.click(`.menu-popup:visible .menu-item[aria-label="Paste From..."]`),
-	]);
-	await chooser.setFiles({ name: "paste.bmp", mimeType: "image/bmp", buffer: bmp });
-	await wait_until(page, () => !!selection);
-	const after = await page.evaluate(() => ({ decoder: typeof window.decodeBMP, size: [selection.width, selection.height] }));
+	const paste_from = await page.locator(`.menu-popup:visible .menu-item[aria-label="Paste From..."]`).count();
+	await page.keyboard.press("Escape");
+	const png = make_test_png();
+	await page.evaluate(async (bytes) => {
+		const file = () => new File([new Uint8Array(bytes)], "photo.png", { type: "image/png" });
+		const clip = new DataTransfer();
+		clip.items.add(file());
+		document.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clip, bubbles: true }));
+		const drop = new DataTransfer();
+		drop.items.add(file());
+		document.body.dispatchEvent(new DragEvent("drop", { dataTransfer: drop, bubbles: true, cancelable: true }));
+	}, [...png]);
+	await page.waitForTimeout(500);
+	const after = await page.evaluate(() => ({ selection: !!selection, blobs: window.P95.recorder.blobs.length }));
 	await page.close();
 	check(before.every((t) => t === "undefined"), `lazy: bmp.js, AnyPalette, gif.js and UTIF.js aren't loaded at startup (${before})`);
-	check(after.decoder === "function" && after.size.join() === "4,2", `lazy: pasting a BMP loads its decoder (${JSON.stringify(after)})`);
+	check(paste_from === 0, "outside: Edit > Paste From... is gone");
+	check(!after.selection && after.blobs === 0, `outside: a pasted or dropped image file pastes nothing and stores nothing (${JSON.stringify(after)})`);
 }
 
 /**
@@ -1531,6 +1522,14 @@ try {
 		await player_page.close();
 		compare(name, recording, replay);
 		recordings[name] = recording;
+		if (name === "all_tools") {
+			const clip = await with_format((format, b64, base64) => {
+				const file = format.decode_p95(b64.decode(base64));
+				const commands = file.header.segments.flatMap((x) => x.events).filter((e) => e[0] === "f").map((e) => e[2]);
+				return { copy: commands.includes("copy_clip"), paste: commands.includes("paste_clip"), blob_pastes: commands.filter((c) => c === "paste").length };
+			}, recording.base64);
+			check(clip.copy && clip.paste && clip.blob_pastes === 0, `all_tools: copy/paste is recorded as copy_clip/paste_clip, with no pasted pictures (${JSON.stringify(clip)})`);
+		}
 		if (name === "image_menu") {
 			check(!recording.counts.b && !recording.counts.p, `image_menu: rotate/stretch/skew store no pixels, and there are no picture keyframes (${JSON.stringify(recording.counts)})`);
 		}

@@ -117,6 +117,12 @@
 		},
 		/** set by the replay controller */
 		player: null,
+		/**
+		 * 2draw: the internal clipboard (an ImageData, or null): what Copy/Cut took from a selection, for Paste.
+		 * Never filled from outside the app. Empty at the start of each segment (recording or replaying).
+		 * @type {ImageData | null}
+		 */
+		clipboard: null,
 	};
 	window.P95 = P95;
 

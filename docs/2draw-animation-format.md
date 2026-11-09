@@ -24,8 +24,8 @@ the engine, player and history restore don't care which version a file is. Recor
 converts its segments losslessly.
 
 PNGs are encoded and decoded byte-exactly (UPNG.js, RGBA, no premultiplication or color management), so their pixels
-can be compared and restored exactly. Since ENGINE_BEHAVIOR 2 the only blobs are pasted/dropped images and text-commit
-snapshots (v1 files may also have embedded starting pictures, rotate/stretch results, picture keyframes and final pictures).
+can be compared and restored exactly. Since ENGINE_BEHAVIOR 2 the only blobs are text-commit snapshots and, in recordings before
+2draw@9369a654, pasted/dropped images (v1 files may also have embedded starting pictures, rotate/stretch results, picture keyframes and final pictures).
 
 ## Header
 
@@ -87,7 +87,7 @@ matter).
 | `k` | | airbrush timer tick (spraying while the pointer is held still is a function of these ticks, not of real time) |
 | `s` | `{changes}` | tool state changes: `bs` brush shape, `b` brush size, `e` eraser size, `a` airbrush size, `p` pencil size, `w` line width, `tm` transparent selection mode, `fg`/`bg`/`tc` colors (left/right/ctrl-click), `pal` palette (28 colors), `font` text tool font, `z` zoom, `so` `{toolId: bits}` fill style (1 outline, 2 fill), and in a segment's first event `tools` (selected tool ids) |
 | `t` | `text` | the text tool's box now contains `text` |
-| `f` | `name, ...args` | a command from the menus/keyboard/dialogs, with dialog results as values: `undo`, `redo`, `cancel(going_to_history_node, discard)`, `deselect(going_to_history_node)`, `delete_selection(name)`, `select_all`, `clear`, `invert_colors`, `flip_horizontal`, `flip_vertical`, `rotate(radians)`, `stretch_and_skew(x_scale, y_scale, h_skew, v_skew)`, `paste(blob, x, y)`, `select_tool(toolId, toggle)`, `go_to_history_node(id, canceling)`, `new_document`, `nudge_selection(dx, dy)`, `scale_selection(factor)` |
+| `f` | `name, ...args` | a command from the menus/keyboard/dialogs, with dialog results as values: `undo`, `redo`, `cancel(going_to_history_node, discard)`, `deselect(going_to_history_node)`, `delete_selection(name)`, `select_all`, `clear`, `invert_colors`, `flip_horizontal`, `flip_vertical`, `rotate(radians)`, `stretch_and_skew(x_scale, y_scale, h_skew, v_skew)`, `paste(blob, x, y)` (recordings before 2draw@9369a654 only; never written now), `copy_clip` (Copy/Cut: the floating selection's pixels become the internal clipboard), `paste_clip(x, y)` (pastes the internal clipboard), `select_tool(toolId, toggle)`, `go_to_history_node(id, canceling)`, `new_document`, `nudge_selection(dx, dy)`, `scale_selection(factor)` |
 | `b` | `kind, blob, ...` | out-of-band pixels for the preceding action: `"text", blob, x, y` (the canvas area under a committed text box: fonts differ between machines); in ENGINE_BEHAVIOR 1 recordings also `"transform", blob` (result of rotate/stretch/skew) |
 | `h` | `hash, width, height` | keyframe: hash of the canvas at this point |
 | `p` | `blob, hash, width, height` | keyframe with the full canvas as a PNG (v1 files only; no longer written) |
@@ -161,7 +161,8 @@ Determinism measures in the engine (ENGINE_BEHAVIOR 1):
   even-odd, pixel centers; Bresenham outlines) instead of WebGL, so results don't depend on the GPU, and replay works
   without WebGL;
 - the airbrush uses `P95.random()` (seeded) and timer ticks are events;
-- pasted/dropped images are stored as PNG (and the recorder pastes the same normalized pixels the replay will);
+- no picture from outside the app is ever stored: Paste only pastes the internal clipboard, which `copy_clip` fills
+  from the drawing itself, so a replay rebuilds it (older recordings stored pasted/dropped images as PNG);
 - text results are stored as pixels (`b` events); rotate and stretch/skew are software nearest-neighbor (ENGINE_BEHAVIOR 2;
   in behavior 1 they were canvas transforms, stored as pixels);
 - time-dependent code reads `P95.now()`.

@@ -2143,28 +2143,50 @@ function show_news() {
 
 // @TODO: DRY between these functions and open_from_* functions further?
 
-// 2draw: drawings on 2draw are drawn here, so no picture comes in from outside the app: not from a file, a drop, or
-// the system clipboard. Copy, Cut and Paste of a selection still work, through internal_clipboard below (Copy also
-// still puts the selection on the system clipboard, which takes nothing in).
+// 2draw: drawings on 2draw are drawn here, so no picture comes in from outside the app: not from a file, a drop, the
+// system clipboard, or the animation file. Copy, Cut and Paste of a selection still work through an internal
+// clipboard, window.P95.clipboard (an ImageData). Both are recorded as commands without pixels: "copy_clip" takes the
+// floating selection's pixels and "paste_clip" pastes them, so a replay rebuilds the clipboard from the drawing
+// itself. (Copy also still puts the selection on the system clipboard, which takes nothing in.)
 const outside_image_message = "Pictures from outside JSPaint can't be pasted or opened on 2draw. Draw it here instead!";
 
-/** @type {HTMLCanvasElement | null} */
-let internal_clipboard = null;
-
-/** Keeps a copy of the current selection for Paste. */
+/** Keeps a copy of the current selection for Paste (Copy and Cut call this). */
 function remember_selection_for_paste() {
 	if (selection && selection.canvas) {
-		internal_clipboard = make_canvas(selection.canvas);
+		window.P95.cmd("copy_clip", [], copy_clip_impl);
+	}
+}
+function copy_clip_impl() {
+	if (selection && selection.canvas) {
+		const { width, height } = selection.canvas;
+		window.P95.clipboard = selection.canvas.getContext("2d").getImageData(0, 0, width, height);
+	} else {
+		window.P95.player?.drift_note("copy without a selection");
 	}
 }
 
 /** Pastes what was last copied or cut in this app; never what is on the system clipboard. */
 function paste_internal_clipboard() {
-	if (internal_clipboard) {
-		paste(make_canvas(internal_clipboard));
-	} else {
+	if (!window.P95.clipboard) {
 		show_error_message(outside_image_message);
+		return;
 	}
+	// The position depends on the scroll position: decided here and recorded.
+	const x = Math.max(0, Math.ceil($canvas_area.scrollLeft() / magnification));
+	const y = Math.max(0, Math.ceil(($canvas_area.scrollTop()) / magnification));
+	window.P95.cmd("paste_clip", [x, y], paste_clip_impl);
+}
+/**
+ * @param {number} x
+ * @param {number} y
+ */
+function paste_clip_impl(x, y) {
+	const clip = window.P95.clipboard;
+	if (!clip) {
+		window.P95.player?.drift_note("paste with an empty clipboard");
+		return;
+	}
+	paste_impl(make_canvas(clip), x, y);
 }
 
 /**
@@ -2179,16 +2201,8 @@ async function choose_file_to_paste() {
 	show_error_message(outside_image_message);
 }
 
-/**
- * @param {HTMLImageElement | HTMLCanvasElement} img_or_canvas
- */
-function paste(img_or_canvas) {
-	// 2draw: recorded command; the position is decided here (it depends on the scroll position) and recorded,
-	// and the recorder stores the image (as normalized RGBA) in the animation.
-	const x = Math.max(0, Math.ceil($canvas_area.scrollLeft() / magnification));
-	const y = Math.max(0, Math.ceil(($canvas_area.scrollTop()) / magnification));
-	return window.P95.cmd("paste", [img_or_canvas, x, y], paste_impl);
-}
+// 2draw: there is no paste() of an outside picture. paste_impl pastes the internal clipboard (paste_clip) and, for
+// recordings made before 2draw@9369a654, the pictures they stored ("paste" commands with a blob).
 /**
  * @param {HTMLImageElement | HTMLCanvasElement} img_or_canvas
  * @param {number} x
@@ -4653,7 +4667,7 @@ export {
 	apply_file_format_and_palette_info, are_you_sure, cancel, change_some_url_params, change_url_param, choose_file_to_paste, cleanup_bitmap_view, clear, confirm_overwrite_capability, delete_selection, deselect, detect_monochrome,
 	edit_copy, edit_cut, edit_paste, exit_fullscreen_if_ios, file_load_from_url, file_new, file_open, file_print, file_save,
 	file_save_as, getSelectionText, get_all_url_params, get_history_ancestors, get_tool_by_id, get_uris, get_url_param, go_to_history_node, handle_keyshortcuts, has_any_transparency, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, load_theme_from_text, make_history_node, make_monochrome_palette, make_monochrome_pattern, make_opaque, make_or_update_undoable, make_stripe_pattern, meld_selection_into_canvas,
-	meld_textbox_into_canvas, open_from_file, open_from_image_info, paste, paste_image_from_file, paste_internal_clipboard, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, remember_selection_for_paste, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,
+	meld_textbox_into_canvas, open_from_file, open_from_image_info, paste_image_from_file, paste_internal_clipboard, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, remember_selection_for_paste, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,
 	toggle_thumbnail, try_exec_command, undo, undoable, update_canvas_rect, update_css_classes_for_conditional_messages, update_disable_aa, update_from_saved_file, update_helper_layer,
 	update_helper_layer_immediately, update_magnified_canvas_size, update_title, view_bitmap, write_image_file
 };
@@ -4678,7 +4692,10 @@ window.P95.register({
 	select_all: () => select_all_impl(),
 	clear: () => clear_impl(),
 	invert_colors: () => image_invert_colors_impl(),
+	// recordings before 2draw@9369a654 stored pasted pictures; new ones can't (see copy_clip_impl)
 	paste: (blob_index, x, y) => paste_impl(window.P95.player.blob_canvas(blob_index), x, y),
+	copy_clip: () => copy_clip_impl(),
+	paste_clip: (x, y) => paste_clip_impl(x, y),
 	go_to_history_node: (id, canceling) => {
 		const node = history_nodes_by_id.get(id);
 		if (node) {

@@ -15,7 +15,7 @@ const STROKE_IDLE_CAP_MS = 1000;
 /** Longest pause between strokes / picture-changing commands (ms) */
 const BETWEEN_STROKES_CAP_MS = 250;
 /** Commands that don't change the picture take no playback time */
-const UI_ONLY_COMMANDS = new Set(["select_tool"]);
+const UI_ONLY_COMMANDS = new Set(["select_tool", "copy_clip"]);
 
 /**
  * Playback time taken by the gap before an event.
@@ -284,6 +284,7 @@ export class ReplayController {
 
 	start_segment(segment, seg) {
 		window.P95.seed(segment.seed);
+		window.P95.clipboard = null;
 		window.P95.behavior = segment.engine?.behavior ?? window.P95.ENGINE_BEHAVIOR;
 		if (window.P95.behavior > window.P95.ENGINE_BEHAVIOR) {
 			console.warn(`[replay] recorded with a newer engine (behavior ${window.P95.behavior}); relying on keyframes`);

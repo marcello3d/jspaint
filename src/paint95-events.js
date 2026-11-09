@@ -154,7 +154,7 @@ const TOOL_IDS = [
 const COMMANDS = [
 	"undo", "redo", "cancel", "deselect", "delete_selection", "select_all", "clear", "invert_colors", "flip_horizontal",
 	"flip_vertical", "rotate", "stretch_and_skew", "paste", "select_tool", "go_to_history_node", "new_document",
-	"nudge_selection", "scale_selection",
+	"nudge_selection", "scale_selection", "copy_clip", "paste_clip",
 ];
 const BLOB_KINDS = ["text", "transform"];
 const BRUSH_SHAPES = ["circle", "square", "reverse_diagonal", "diagonal"];
