@@ -8,17 +8,23 @@
 //     window.paint95Host = {
 //       submit(blob /* image/png */, extra?: { animation?: Blob /* .p95 */ }): Promise<void>, // uploads and navigates away on success; rejects with an Error on failure
 //       ready?(): void,                            // called once the app has loaded
+//       draftSaved?(info: { at: number }): void,   // the device copy was saved (else postMessage {type: "2draw:draft-saved", at})
 //     }
+//   submit's extra also carries uploaded(): Promise<void>, which the host may call (and await, briefly) once the server
+//   has accepted the upload and before it navigates away: it deletes the device copy.
 //   Without a host (standalone, or cross-origin parent), Submit downloads the PNG instead.
 //   The app exposes window.paint95History = { canUndo(), canRedo(), onChange(cb) => unsubscribe } on its own window.
 //   &anim=<url of a previous .p95> continues that recording (see docs/2draw-animation-format.md).
+//   &draft=<key> keeps a copy of the drawing in progress on this device under that key and restores it on the next
+//   load (paint95-draft.js).
 //   In replay mode (index.html?replay=1, used by player.js) none of this runs.
 
 import { change_url_param, deselect, set_magnification, show_error_message } from "./functions.js";
 import { $G, E, make_canvas } from "./helpers.js";
 import { showMessageBox } from "./msgbox.js";
 import { fetch_cors, is_reference_url, load_image_cors } from "./paint95-fetch.js";
-import { decode_p95, hash_image_data } from "./paint95-format.js";
+import { Autosaver, expire_drafts, load_draft, request_persistent_storage, set_draft_aside } from "./paint95-draft.js";
+import { decode_p95, decode_png } from "./paint95-format.js";
 import { restore_history } from "./paint95-restore.js";
 import { Recorder } from "./paint95-record.js";
 
@@ -53,6 +59,21 @@ function init_editor() {
 
 	/** @type {Recorder | null} */
 	let recorder = null;
+	/** @type {Autosaver | null} */
+	let autosaver = null;
+	const draft_key = window.paint95_no_draft ? null : window.paint95_draft_key;
+
+	/** Tells the 2draw page the drawing is saved on this device (for its "Saved on this device" line) */
+	function announce_saved(at) {
+		try {
+			const host = window.parent && window.parent !== window ? window.parent.paint95Host : null;
+			if (host && typeof host.draftSaved === "function") {
+				host.draftSaved({ at });
+			} else if (window.parent && window.parent !== window) {
+				window.parent.postMessage({ type: "2draw:draft-saved", at }, location.origin);
+			}
+		} catch (_error) { /* cross-origin or no parent */ }
+	}
 
 	// #region History API (for the parent page, e.g. the iOS app's squeeze palette dimming undo/redo)
 
@@ -181,7 +202,11 @@ function init_editor() {
 			} catch (error) {
 				console.error("Failed to finalize the animation", error);
 			}
-			await host.submit(blob, animation ? { animation } : undefined);
+			// The host calls uploaded() once the server has the drawing, before it leaves the page: then the device
+			// copy goes.
+			const delete_device_copy = () => (autosaver ? autosaver.delete().catch((error) => { console.warn("Couldn't delete the device copy", error); }) : Promise.resolve());
+			await host.submit(blob, animation ? { animation, uploaded: delete_device_copy } : { uploaded: delete_device_copy });
+			delete_device_copy();
 			// The host navigates away on success. Leave the button disabled so it can't be submitted twice,
 			// but recover eventually in case the page stays put.
 			saved = true;
@@ -278,18 +303,95 @@ function init_editor() {
 		}
 	}
 
+	/**
+	 * The copy of this drawing saved on this device, if any (expiring old copies first).
+	 * @returns {Promise<Awaited<ReturnType<typeof load_draft>>>}
+	 */
+	async function find_device_copy() {
+		try {
+			const expired = await expire_drafts();
+			if (expired) {
+				console.log(`[autosave] deleted ${expired} device ${expired === 1 ? "copy" : "copies"} older than 30 days`);
+			}
+		} catch (error) {
+			console.warn("[autosave] couldn't expire old device copies", error);
+		}
+		let draft = null;
+		try {
+			draft = await load_draft(draft_key);
+		} catch (error) {
+			console.error("[autosave] the device copy can't be read; setting it aside", error);
+			await set_draft_aside(draft_key).catch(() => { });
+			return null;
+		}
+		if (!draft) {
+			return null;
+		}
+		const saved_size = draft.meta.required || {};
+		if (saved_size.width !== required_width || saved_size.height !== required_height) {
+			// Clearly not the same drawing setup: ask.
+			const answer = await showMessageBox({
+				message: `A copy of this drawing saved on this device is ${saved_size.width}×${saved_size.height}, but this drawing is now ${required_width}×${required_height}.\n\nRestore the saved copy anyway? It is cropped or padded to ${required_width}×${required_height} when you submit.`,
+				iconID: "warning",
+				buttons: [
+					{ label: "Restore", value: "restore", default: true },
+					{ label: "Start over", value: "start-over" },
+				],
+			});
+			if (answer !== "restore") {
+				// kept aside (still expires after 30 days), not deleted
+				await set_draft_aside(draft_key).catch(() => { });
+				return null;
+			}
+		}
+		return draft;
+	}
+
 	(async () => {
 		zoom_out_to_fit();
-		const previous_promise = window.paint95_anim_url ? load_previous_animation(window.paint95_anim_url) : Promise.resolve(null);
+		const draft = draft_key ? await find_device_copy() : null;
+		const previous_promise = !draft && window.paint95_anim_url ? load_previous_animation(window.paint95_anim_url) : Promise.resolve(null);
 		let loaded = false;
-		if (window.paint95_load_url) {
+		if (window.paint95_load_url && !draft) {
 			loaded = await load_initial_image(window.paint95_load_url);
 		}
-		const previous = loaded ? await previous_promise : null;
-		// Revising: resume from the previous recording (replayed in the editor, so its undo history is back).
+		let previous = loaded ? await previous_promise : null;
 		let history_keep = null;
 		let snapped = false;
-		if (previous && !window.paint95_no_history) {
+		let restored_meta = null;
+		if (draft) {
+			// The copy saved on this device beats a blank start and the previous version: replay it, so its undo history
+			// is back, and keep recording from there.
+			try {
+				const result = await restore_history(draft.file, {
+					width: required_width,
+					height: required_height,
+					expected_hash: draft.meta.hash,
+					fallback_picture: draft.snapshot ? () => decode_png(draft.snapshot) : null,
+					title: "Restoring your drawing",
+					message: "Restoring your drawing from this device…",
+				});
+				previous = draft.file;
+				history_keep = result.keep;
+				snapped = result.snapped;
+				restored_meta = draft.meta;
+				saved = false;
+				set_magnification(1);
+				zoom_out_to_fit();
+				announce_saved(draft.meta.saved);
+			} catch (error) {
+				console.error("[autosave] couldn't restore the device copy", error);
+				const params = new URLSearchParams(location.search);
+				const aside = await set_draft_aside(draft_key).then(() => true, () => false);
+				if (!aside) {
+					// leave it alone entirely on this load
+					params.set("p95nodraft", "1");
+				}
+				location.replace(`${location.pathname}?${params}${location.hash}`);
+				return;
+			}
+		} else if (previous && !window.paint95_no_history) {
+			// Revising: resume from the previous recording (replayed in the editor, so its undo history is back).
 			const expected_image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 			try {
 				const result = await restore_history(previous, { width: required_width, height: required_height, expected_image_data });
@@ -314,6 +416,27 @@ function init_editor() {
 		} catch (error) {
 			console.error("Failed to start recording", error);
 			recorder = null;
+		}
+		if (recorder && draft_key) {
+			try {
+				let first = true;
+				autosaver = new Autosaver({
+					key: draft_key,
+					recorder,
+					required: { width: required_width, height: required_height },
+					restored_meta,
+					onsaved: ({ at }) => {
+						announce_saved(at);
+						if (first) {
+							first = false;
+							request_persistent_storage();
+						}
+					},
+				});
+				window.paint95_autosaver = autosaver;
+			} catch (error) {
+				console.error("[autosave] couldn't start", error);
+			}
 		}
 		try {
 			get_host()?.ready?.();

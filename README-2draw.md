@@ -46,6 +46,13 @@ const off = h.onChange(() => {});  // called after each history change (new step
 ```
 
 - `anim` (optional): URL of the previous `.p95` when editing an existing drawing; the new recording continues it.
+- `draft` (optional): 2draw's draft key. The drawing in progress is saved on the device (IndexedDB) under it, a moment
+  after each change, and restored (with its undo history) when the editor opens with that key again; deleted after a
+  successful submit. See "Device drafts" in [docs/2draw-animation-format.md](docs/2draw-animation-format.md).
+  The host may define `draftSaved({ at })` (called after each save) and call `extra.uploaded()` from `submit` once the
+  server has the drawing (it deletes the device copy).
+
+Test: `npm run test:2draw-autosave`.
 
 ## Animations
 

@@ -32,19 +32,24 @@ export function history_keep_for(width, height) {
  * @param {object} options
  * @param {number} options.width - required canvas size
  * @param {number} options.height
- * @param {ImageData} options.expected_image_data - the picture the editor loaded (the previous version, as posted)
- * @returns {Promise<{ keep: number, snapped: boolean, drift: any, ms: number }>}
+ * @param {ImageData} [options.expected_image_data] - the picture the editor loaded (the previous version, as posted)
+ * @param {number} [options.expected_hash] - instead of expected_image_data (a device draft): the hash the replay should
+ *   end on (hash_image_data)...
+ * @param {(() => ImageData | null) | null} [options.fallback_picture] - ...and the picture to set if it doesn't
+ * @param {string} [options.title] - of the progress box
+ * @param {string} [options.message]
+ * @returns {Promise<{ keep: number, snapped: boolean, drift: any, ms: number, matched: boolean }>}
  */
-export async function restore_history(file, { width, height, expected_image_data }) {
+export async function restore_history(file, { width, height, expected_image_data, expected_hash, fallback_picture = null, title = "Restoring history", message = "Restoring the undo history…" }) {
 	const start_time = performance.now();
 	const P95 = window.P95;
 
 	// Progress box; the overlay blocks input while replaying. It can't be skipped or closed.
 	const $overlay = $(E("div")).addClass("paint95-restore-overlay").appendTo("body");
-	const $w = $DialogWindow("Restoring history");
+	const $w = $DialogWindow(title);
 	$w.addClass("paint95-restore-window");
 	$w.find(".window-close-button").hide();
-	const $message = $(E("div")).css({ padding: "12px 16px 4px", minWidth: "240px" }).text("Restoring the undo history…");
+	const $message = $(E("div")).css({ padding: "12px 16px 4px", minWidth: "240px" }).text(message);
 	const $progress = $(E("progress")).attr({ max: 100, value: 0 }).css({ width: "100%", margin: "4px 0 12px" });
 	$w.$main.append($message, $(E("div")).css({ padding: "0 16px" }).append($progress));
 	$w.center();
@@ -86,12 +91,25 @@ export async function restore_history(file, { width, height, expected_image_data
 	const keep = history_keep_for(width, height);
 	P95.prune_history(keep);
 	// Continue from exactly the posted picture.
-	const snapped = main_canvas.width !== width || main_canvas.height !== height ||
-		hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height)) !== hash_image_data(expected_image_data);
-	if (snapped) {
-		P95.snap_to_picture(expected_image_data);
+	const actual_hash = hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height));
+	let snapped = false;
+	let matched;
+	if (expected_image_data) {
+		matched = actual_hash === hash_image_data(expected_image_data);
+		snapped = main_canvas.width !== width || main_canvas.height !== height || !matched;
+		if (snapped) {
+			P95.snap_to_picture(expected_image_data);
+		}
+	} else {
+		// A device draft: the replay should end exactly where the draft was saved; if not, set its snapshot.
+		matched = actual_hash === expected_hash;
+		const picture = matched ? null : fallback_picture?.() ?? null;
+		if (picture) {
+			P95.snap_to_picture(picture);
+			snapped = true;
+		}
 	}
 	const ms = Math.round(performance.now() - start_time);
-	console.log(`Restored the undo history in ${ms} ms${snapped ? ` (then set the canvas to the posted picture${drift ? `; the replay drifted: ${drift.type}` : ""})` : ""}`);
-	return { keep, snapped, drift, ms };
+	console.log(`Restored the undo history in ${ms} ms${snapped ? ` (then set the canvas to the ${expected_image_data ? "posted picture" : "saved snapshot"}${drift ? `; the replay drifted: ${drift.type}` : ""})` : ""}${matched ? "" : " (the replay did not end on the expected picture)"}`);
+	return { keep, snapped, drift, ms, matched };
 }

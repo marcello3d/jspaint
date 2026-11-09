@@ -195,6 +195,42 @@ Only a missing (404, network error) or unreadable (corrupt, unknown container) f
 `continue` segment without `history`, or an `image` start if the file couldn't be loaded at all. (`&p95nohistory=1`, set
 by a reload if replaying throws, does the same.)
 
+### Device drafts (`&draft=<key>`)
+
+With `&draft=<key>` (2draw's draft key, `worker/src/lib/drafts.ts` there), the editor keeps the recording so far in
+IndexedDB on the device (`src/paint95-draft.js`) and restores it the next time it opens with that key: reload,
+back/forward, or `/draw/<key>/` in a new tab. Without the parameter nothing is stored.
+
+- **What a draft is.** Exactly what `Recorder.finalize()` would put in a `.p95` at that moment (it doesn't end the
+  recording, so any moment is a valid in-progress recording): every earlier segment, the current segment's header and
+  events so far with `end: { hash, width, height }` of the canvas at the save, and the blobs. It is stored in pieces
+  rather than as one file, so a save writes only what changed:
+  - DB `2draw-paint95-drafts`, store `drafts` (key `key`): `{ key, v: 1, tool: "paint95", saved (ms), session,
+    required: { width, height } (the w/h it was opened with), width, height, hash (canvas at the save), truncated,
+    segments: [{ info (segment header without events), chunks: [part names], tail (deflated events) }],
+    blobs: [part names], snapshot: { name, hash, at } | null, events }`.
+  - store `parts` (key `[key, name]`): `<session>:c<n>`: a sealed chunk of 2048 events of the session's segment,
+    deflated `encode_events` output, written once; `<session>:p<n>`: an earlier segment (a revision's posted recording),
+    written once on the first save; `<session>:b<n>`: blob `n` as PNG, written once (the recorder then keeps it as PNG,
+    so `finalize()` doesn't encode it again); `<session>:snap`: a PNG of the canvas.
+  - Chunks are encoded independently, so decoding each and concatenating the events gives back the segment's events.
+    `session` is random per page load, so two tabs on one draft never overwrite each other's pieces (the last save wins).
+- **Saving.** About 1.5 s after the last recorded event (the recorder's `onchange`), in idle time, never while a pointer
+  is down or a recorded event is being dispatched; at once when the page is hidden (`visibilitychange`, `pagehide`). A
+  save rewrites the record (with the tail: the events since the last sealed chunk) and adds any new chunks and blobs.
+  The snapshot is encoded with `toBlob` (off the main thread) and written afterwards in its own transaction, at most
+  every 20 s and when the page is hidden. Each save is announced to the page (`paint95Host.draftSaved({ at })`, else
+  `postMessage({ type: "2draw:draft-saved", at })`). The first save asks once per device for `navigator.storage.persist()`.
+- **Restoring.** The draft is replayed like a revision's previous recording (Restoring the undo history, above), and it
+  wins over `load`/`anim`: they are not fetched. The replay should end on the record's `hash`; if it doesn't, and the
+  snapshot was taken at that save (`snapshot.hash === hash`), the snapshot is set as one more step (`snap: true` with an
+  embedded `blob`), as for a revision. The recording then continues as a new `continue` segment with `history: true`, so
+  every reload adds a segment. If the saved `required` size differs from `w`/`h`, the editor asks first (Restore / Start
+  over). An unreadable draft, or one set aside by Start over, is moved to `<key>~unreadable-<time>`, not deleted.
+- **Deleting.** `submit`'s `extra.uploaded()` (called by the host once the server has accepted the upload, before it
+  leaves) deletes the draft; so does the editor itself once `submit` resolves. Drafts not saved for 30 days are deleted
+  whenever the editor loads.
+
 ### Loading `load` and `anim`
 
 Both are fetched with CORS, `cache: "no-store"`, and an extra `p95load=1` query parameter (falling back to an

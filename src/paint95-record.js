@@ -96,6 +96,8 @@ export class Recorder {
 		/** @type {Map<number, string>} recorded id -> last "M" fields, for the short "m" form */
 		this.last_move_fields = new Map();
 		this.clear_timer = 0;
+		/** @type {(() => void) | null} called after every recorded event (the device autosave, paint95-draft.js) */
+		this.onchange = null;
 
 		this.previous_segments = [];
 		if (previous) {
@@ -195,6 +197,7 @@ export class Recorder {
 			this.stopped = true;
 			this.segment.truncated = true;
 		}
+		this.onchange?.();
 	}
 
 	/**
