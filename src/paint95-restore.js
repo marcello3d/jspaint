@@ -102,7 +102,8 @@ export async function restore_history(file, { width, height, expected_image_data
 		}
 	} else {
 		// A device draft: the replay should end exactly where the draft was saved; if not, set its snapshot.
-		matched = actual_hash === expected_hash;
+		// (no hash: saved mid-stroke, its picture is whatever the replay ends on)
+		matched = expected_hash == null || actual_hash === expected_hash;
 		const picture = matched ? null : fallback_picture?.() ?? null;
 		if (picture) {
 			P95.snap_to_picture(picture);

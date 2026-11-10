@@ -8,8 +8,14 @@
 //     window.paint95Host = {
 //       submit(blob /* image/png */, extra?: { animation?: Blob /* .p95 */ }): Promise<void>, // uploads and navigates away on success; rejects with an Error on failure
 //       ready?(): void,                            // called once the app has loaded
-//       draftSaved?(info: { at: number }): void,   // the device copy was saved (else postMessage {type: "2draw:draft-saved", at})
+//       draftSaved?(info: { at: number } | { failed: true }): void, // the device copy was saved, or a save failed
+//                                                  // (else postMessage {type: "2draw:draft-saved", at} / {…, failed: true})
 //     }
+//   With a draft key it also sets, on the parent (as Lascaux Pocket does; 2draw.net client/draw-bar.ts, applet-boot.ts):
+//     drawPersists: boolean   the drawing is kept on this device, so the bar's Close needn't ask
+//     drawUnchanged: boolean  nothing drawn yet (and no copy on this device): leaving asks nothing
+//     drawGuard(on)           the parent's leave warning: on while leaving would lose something
+//     drawFlush(): Promise    saves now (Close waits for it, 2 s at most)
 //   submit's extra also carries uploaded(): Promise<void>, which the host may call (and await, briefly) once the server
 //   has accepted the upload and before it navigates away: it deletes the device copy.
 //   Without a host (standalone, or cross-origin parent), Submit downloads the PNG instead.
@@ -23,8 +29,8 @@ import { change_url_param, deselect, set_magnification, show_error_message } fro
 import { $G, E, make_canvas } from "./helpers.js";
 import { showMessageBox } from "./msgbox.js";
 import { fetch_cors, is_reference_url, load_image_cors } from "./paint95-fetch.js";
-import { Autosaver, expire_drafts, load_draft, request_persistent_storage, set_draft_aside } from "./paint95-draft.js";
-import { decode_p95, decode_png } from "./paint95-format.js";
+import { Autosaver, expire_drafts, load_draft, request_persistent_storage, set_draft_aside, take_edit_lock } from "./paint95-draft.js";
+import { decode_p95, decode_png, hash_image_data } from "./paint95-format.js";
 import { restore_history } from "./paint95-restore.js";
 import { Recorder } from "./paint95-record.js";
 
@@ -63,16 +69,108 @@ function init_editor() {
 	let autosaver = null;
 	const draft_key = window.paint95_no_draft ? null : window.paint95_draft_key;
 
-	/** Tells the 2draw page the drawing is saved on this device (for its "Saved on this device" line) */
-	function announce_saved(at) {
+	/**
+	 * Tells the 2draw page the drawing is saved on this device, or that saving failed (its "Saved on this device" /
+	 * "Not saved" line)
+	 * @param {{ at: number } | { failed: true }} info
+	 */
+	function announce_draft(info) {
 		try {
 			const host = window.parent && window.parent !== window ? window.parent.paint95Host : null;
 			if (host && typeof host.draftSaved === "function") {
-				host.draftSaved({ at });
+				host.draftSaved(info);
 			} else if (window.parent && window.parent !== window) {
-				window.parent.postMessage({ type: "2draw:draft-saved", at }, location.origin);
+				window.parent.postMessage({ type: "2draw:draft-saved", ...info }, location.origin);
 			}
 		} catch (_error) { /* cross-origin or no parent */ }
+	}
+	const announce_saved = (at) => announce_draft({ at });
+
+	/** The same-origin 2draw page, or null */
+	function parent_page() {
+		try {
+			if (window.parent && window.parent !== window && window.parent.location.origin === location.origin) {
+				return window.parent;
+			}
+		} catch (_error) { /* cross-origin */ }
+		return null;
+	}
+
+	// The parent's leave question (see the contract above): asked only while leaving would lose something.
+	/** @type {string} */
+	let shown_leave = "";
+	function sync_leave() {
+		const page = parent_page();
+		if (!page || !autosaver) {
+			return;
+		}
+		const state = autosaver.state();
+		const unchanged = !autosaver.ever_saved && undos.length === 0;
+		const persists = state.saved || state.yielded;
+		const guard = !state.yielded && (state.pending || (!persists && !unchanged));
+		const key = `${persists}|${unchanged}|${guard}`;
+		if (key === shown_leave) {
+			return;
+		}
+		shown_leave = key;
+		try {
+			page.drawPersists = persists;
+			page.drawUnchanged = unchanged;
+			page.drawGuard?.(guard);
+		} catch (error) {
+			console.error("[autosave] couldn't tell the page", error);
+		}
+	}
+
+	// Another tab took this drawing over (take_edit_lock): cover the app; Continue here takes it back.
+	let yielded = false;
+	function show_taken_cover() {
+		if (document.getElementById("paint95-taken")) {
+			return;
+		}
+		const cover = document.createElement("div");
+		cover.id = "paint95-taken";
+		cover.setAttribute("role", "dialog");
+		cover.setAttribute("aria-modal", "true");
+		cover.style.cssText = "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;";
+		const card = document.createElement("div");
+		card.style.cssText = "background:#c0c0c0;color:#000;border:2px outset #fff;padding:14px 18px;max-width:300px;font:12px sans-serif;text-align:center;";
+		const title = document.createElement("p");
+		title.style.cssText = "margin:0 0 6px;font-weight:bold;";
+		title.textContent = "This drawing is open in another tab.";
+		const words = document.createElement("p");
+		words.style.cssText = "margin:0 0 12px;";
+		words.textContent = "Your drawing is saved on this device.";
+		const button = document.createElement("button");
+		button.type = "button";
+		button.textContent = "Continue here";
+		button.style.cssText = "min-width:110px;padding:4px 10px;";
+		button.addEventListener("click", () => {
+			button.disabled = true;
+			location.reload();
+		});
+		card.append(title, words, button);
+		cover.append(card);
+		for (const type of ["pointerdown", "pointermove", "pointerup", "touchstart", "wheel", "keydown", "contextmenu"]) {
+			cover.addEventListener(type, (e) => {
+				if (e.target !== button) {
+					e.stopPropagation();
+					if (type !== "pointermove" && type !== "touchstart" && type !== "wheel") {
+						e.preventDefault();
+					}
+				}
+			});
+		}
+		document.body.append(cover);
+		button.focus();
+	}
+	async function on_taken() {
+		yielded = true;
+		show_taken_cover();
+		if (autosaver) {
+			await autosaver.yield_edit();
+		}
+		sync_leave();
 	}
 
 	// #region History API (for the parent page, e.g. the iOS app's squeeze palette dimming undo/redo)
@@ -349,7 +447,15 @@ function init_editor() {
 
 	(async () => {
 		zoom_out_to_fit();
-		const draft = draft_key ? await find_device_copy() : null;
+		if (draft_key) {
+			// first be the only editor of this draft on this device: another tab saves and lets go, then its copy is read
+			try {
+				await take_edit_lock(draft_key, on_taken);
+			} catch (error) {
+				console.error("[autosave] couldn't take the edit lock", error);
+			}
+		}
+		const draft = draft_key && !yielded ? await find_device_copy() : null;
 		const previous_promise = !draft && window.paint95_anim_url ? load_previous_animation(window.paint95_anim_url) : Promise.resolve(null);
 		let loaded = false;
 		if (window.paint95_load_url && !draft) {
@@ -375,6 +481,17 @@ function init_editor() {
 				history_keep = result.keep;
 				snapped = result.snapped;
 				restored_meta = draft.meta;
+				if (draft.meta.open_stroke && !result.snapped) {
+					// saved mid-stroke (no picture hash then): the replay's picture is where it ends
+					const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+					const end = { hash: hash_image_data(image_data), width: image_data.width, height: image_data.height };
+					const segments = draft.file.header.segments;
+					segments[segments.length - 1].end = end;
+					const stored = restored_meta.segments[restored_meta.segments.length - 1];
+					if (stored && stored.info) {
+						stored.info.end = end;
+					}
+				}
 				saved = false;
 				set_magnification(1);
 				zoom_out_to_fit();
@@ -417,7 +534,7 @@ function init_editor() {
 			console.error("Failed to start recording", error);
 			recorder = null;
 		}
-		if (recorder && draft_key) {
+		if (recorder && draft_key && !yielded) {
 			try {
 				let first = true;
 				autosaver = new Autosaver({
@@ -432,8 +549,16 @@ function init_editor() {
 							request_persistent_storage();
 						}
 					},
+					onfailed: () => announce_draft({ failed: true }),
+					onstate: () => sync_leave(),
 				});
 				window.paint95_autosaver = autosaver;
+				$G.on("history-update", () => sync_leave());
+				const page = parent_page();
+				if (page) {
+					page.drawFlush = () => (autosaver ? autosaver.flush() : Promise.resolve());
+				}
+				sync_leave();
 			} catch (error) {
 				console.error("[autosave] couldn't start", error);
 			}

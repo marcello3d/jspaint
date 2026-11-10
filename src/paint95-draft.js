@@ -30,6 +30,8 @@ export const CHUNK_EVENTS = 2048;
 export const SAVE_DELAY_MS = 1500;
 /** A new snapshot at most this often (and when the page is hidden) */
 export const SNAPSHOT_INTERVAL_MS = 20000;
+/** After a failed save, try again this long after (and at every change) */
+export const RETRY_MS = 5000;
 const DRAFT_VERSION = 1;
 
 /** A 2draw draft key (lib/drafts.ts): 12 lowercase Crockford base32 characters; anything URL-safe and short is accepted. */
@@ -170,7 +172,7 @@ export async function delete_draft(key) {
 
 /**
  * Keeps an unreadable draft for 30 more days under another key (so a new session doesn't overwrite it), then deletes
- * it under its own key.
+ * it under its own key. The 30 days count from now (aside_at), not from its last save.
  * @param {string} key
  */
 export async function set_draft_aside(key) {
@@ -185,7 +187,7 @@ export async function set_draft_aside(key) {
 		for (const part of list) {
 			parts.put({ ...part, key: aside });
 		}
-		drafts.put({ ...meta, key: aside, set_aside: true });
+		drafts.put({ ...meta, key: aside, set_aside: true, aside_at: Date.now() });
 		drafts.delete(key);
 		parts.delete(parts_range(key));
 	}
@@ -194,7 +196,7 @@ export async function set_draft_aside(key) {
 }
 
 /**
- * Deletes drafts not saved for DRAFT_MAX_AGE_MS (all drafts in this database are this tool's).
+ * Deletes drafts not saved (or set aside) for DRAFT_MAX_AGE_MS (all drafts in this database are this tool's).
  * @returns {Promise<number>} how many were deleted
  */
 export async function expire_drafts(now = Date.now()) {
@@ -213,7 +215,8 @@ export async function expire_drafts(now = Date.now()) {
 				return;
 			}
 			const meta = cursor.value;
-			if (!(typeof meta.saved === "number" && now - meta.saved < DRAFT_MAX_AGE_MS)) {
+			const at = Math.max(typeof meta.saved === "number" ? meta.saved : 0, typeof meta.aside_at === "number" ? meta.aside_at : 0);
+			if (!(at > 0 && now - at < DRAFT_MAX_AGE_MS)) {
 				parts.delete(parts_range(meta.key));
 				cursor.delete();
 				count++;
@@ -284,12 +287,25 @@ export class Autosaver {
 	 * @param {{ width: number, height: number }} options.required - the drawing's size on 2draw
 	 * @param {any} [options.restored_meta] - the draft record this session was restored from: its pieces are reused
 	 * @param {(info: { at: number, ms: number, bytes: number }) => void} [options.onsaved]
+	 * @param {(error: any) => void} [options.onfailed] - a save failed (it is tried again at the next change, and
+	 *   every RETRY_MS)
+	 * @param {(state: AutosaveState) => void} [options.onstate] - whenever the state changes
 	 */
-	constructor({ key, recorder, required, restored_meta = null, onsaved }) {
+	constructor({ key, recorder, required, restored_meta = null, onsaved, onfailed, onstate }) {
 		this.key = key;
 		this.recorder = recorder;
 		this.required = required;
 		this.onsaved = onsaved;
+		this.onfailed = onfailed;
+		this.onstate = onstate;
+		/** the last save failed (and nothing has saved since) */
+		this.failed = false;
+		/** a copy of this drawing is on this device (saved by this page, or the one it was restored from) */
+		this.ever_saved = !!restored_meta;
+		/** another tab took the drawing over (yield_edit): no more saves here */
+		this.yielded = false;
+		/** @type {string} the state last reported */
+		this.reported = "";
 		this.session = make_session_id();
 		this.prefix = `${this.session}:`;
 		/** stored form of the previous segments (restored from the draft), or null until written */
@@ -322,6 +338,8 @@ export class Autosaver {
 		this.last_stats = null;
 
 		recorder.onchange = () => this.changed();
+		// Hidden (a swipe back, the app switcher, another tab) may be the last chance: on iOS the page is often never
+		// shown again. Save now, up to the stroke under way.
 		const on_hidden = () => {
 			if (document.visibilityState === "hidden") {
 				this.save_now();
@@ -329,6 +347,36 @@ export class Autosaver {
 		};
 		document.addEventListener("visibilitychange", on_hidden);
 		addEventListener("pagehide", () => this.save_now());
+	}
+
+	/**
+	 * @typedef {object} AutosaveState
+	 * @property {boolean} pending - leaving now would lose something: a change not saved yet, a save under way, a
+	 *   stroke under way, or a failing store
+	 * @property {boolean} failed - the last save failed
+	 * @property {boolean} saved - a copy is on this device (and saving works)
+	 * @property {boolean} yielded - another tab has this drawing now
+	 */
+
+	/** @returns {AutosaveState} */
+	state() {
+		const pending = !this.yielded && !this.deleted && (this.dirty || !!this.saving || this.failed || this.recorder.active_pointers.size > 0);
+		return { pending, failed: this.failed, saved: this.ever_saved && !this.failed, yielded: this.yielded };
+	}
+
+	/** Tells onstate when the state changed */
+	report() {
+		const state = this.state();
+		const key = `${state.pending}|${state.failed}|${state.saved}|${state.yielded}`;
+		if (key === this.reported) {
+			return;
+		}
+		this.reported = key;
+		try {
+			this.onstate?.(state);
+		} catch (error) {
+			console.error("[autosave] onstate failed", error);
+		}
 	}
 
 	/** Called by the recorder after every recorded event */
@@ -341,6 +389,7 @@ export class Autosaver {
 		if (!this.timer) {
 			this.timer = setTimeout(() => this.on_timer(), SAVE_DELAY_MS);
 		}
+		this.report();
 	}
 
 	on_timer() {
@@ -375,18 +424,45 @@ export class Autosaver {
 		return this.recorder.active_pointers.size > 0 || P95.in_dispatch || P95.depth > 0 || P95.mode !== "edit";
 	}
 
-	/** Saves right away if anything changed (page hidden); still never mid-stroke */
+	/**
+	 * Saves right away if anything changed (page hidden, Close, another tab taking over), up to the stroke under way:
+	 * that stroke is stored as if it ended where the pointer is now (write). Never while replaying.
+	 * @returns {Promise<void>} the save
+	 */
 	save_now() {
 		if (!this.dirty || this.deleted || this.disabled) {
-			return;
+			return this.saving ?? Promise.resolve();
 		}
 		const P95 = window.P95;
-		if (this.recorder.active_pointers.size > 0 || P95.depth > 0 || P95.mode !== "edit") {
-			return;
+		if (P95.depth > 0 || P95.mode !== "edit") {
+			return this.saving ?? Promise.resolve();
 		}
 		clearTimeout(this.timer);
 		this.timer = 0;
-		this.save();
+		return this.save();
+	}
+
+	/** Saves everything now and waits for it (Close: window.drawFlush). */
+	async flush() {
+		for (let i = 0; i < 3 && !this.deleted && !this.disabled && (this.dirty || this.saving); i++) {
+			await this.save_now();
+		}
+	}
+
+	/** Another tab takes this drawing over: a last save, then no more (edit lock, take_edit_lock). */
+	async yield_edit() {
+		if (this.yielded) {
+			return;
+		}
+		try {
+			await this.flush();
+		} finally {
+			this.yielded = true;
+			this.disabled = true;
+			clearTimeout(this.timer);
+			this.timer = 0;
+			this.report();
+		}
 	}
 
 	/**
@@ -401,41 +477,67 @@ export class Autosaver {
 			this.again = true;
 			return this.saving;
 		}
-		this.saving = this.write().catch((error) => {
+		this.dirty = false;
+		this.saving = this.write().then(() => {
+			this.failed = false;
+		}, (error) => {
+			// (QuotaExceededError: the device is full; anything else: IndexedDB broke.) Nothing it wrote counts (write
+			// keeps its pieces only once the transaction is done), so the next try writes it all again.
 			console.warn("[autosave] couldn't save the drawing on this device", error);
-			if (error && error.name === "QuotaExceededError") {
-				this.disabled = true;
+			this.dirty = true;
+			const first = !this.failed;
+			this.failed = true;
+			if (first) {
+				try {
+					this.onfailed?.(error);
+				} catch (callback_error) {
+					console.error("[autosave] onfailed failed", callback_error);
+				}
+			}
+			if (!this.timer && !this.deleted && !this.disabled) {
+				this.timer = setTimeout(() => this.on_timer(), RETRY_MS);
 			}
 		}).finally(() => {
 			this.saving = null;
 			if (this.again) {
 				this.again = false;
-				if (this.dirty) {
-					this.changed();
+				if (this.dirty && !this.failed) {
+					if (document.visibilityState === "hidden") {
+						// (timers may never run again in a hidden page)
+						this.save_now();
+					} else {
+						this.changed();
+					}
 				}
 			}
+			this.report();
 		});
+		this.report();
 		return this.saving;
 	}
 
 	async write() {
 		const start = performance.now();
 		const recorder = this.recorder;
-		this.dirty = false;
 		/** @type {{ name: string, data: Uint8Array }[]} */
 		const puts = [];
+		// What this save adds, kept (in this) only once it is written: a failed save leaves nothing half-counted.
+		const previous_stored = this.previous_stored.slice();
+		const blob_names = this.blob_names.slice();
+		const chunk_names = this.chunk_names.slice();
+		let sealed = this.sealed;
 
 		// previous sessions (a revision's posted recording): written once
 		recorder.previous_segments.forEach((segment, i) => {
-			if (!this.previous_stored[i]) {
+			if (!previous_stored[i]) {
 				const name = `${this.prefix}p${i}`;
 				puts.push({ name, data: pack_events(segment.events) });
-				this.previous_stored[i] = { info: segment_info(segment), chunks: [name], tail: null };
+				previous_stored[i] = { info: segment_info(segment), chunks: [name], tail: null };
 			}
 		});
 		// blobs: written once, as PNG (kept as PNG in the recorder too, so finalize doesn't encode them again)
 		for (let i = 0; i < recorder.blobs.length; i++) {
-			if (!this.blob_names[i]) {
+			if (!blob_names[i]) {
 				const blob = recorder.blobs[i];
 				const png = "png" in blob ? blob.png : encode_png(blob.image_data);
 				if (!("png" in blob)) {
@@ -443,24 +545,31 @@ export class Autosaver {
 				}
 				const name = `${this.prefix}b${i}`;
 				puts.push({ name, data: png });
-				this.blob_names[i] = name;
+				blob_names[i] = name;
 			}
 		}
 		// this session's events: sealed chunks, plus the rest as the tail
 		const events = recorder.segment.events;
 		const count = events.length;
-		while (count - this.sealed >= CHUNK_EVENTS) {
-			const name = `${this.prefix}c${this.chunk_names.length}`;
-			puts.push({ name, data: pack_events(events.slice(this.sealed, this.sealed + CHUNK_EVENTS)) });
-			this.chunk_names.push(name);
-			this.sealed += CHUNK_EVENTS;
+		while (count - sealed >= CHUNK_EVENTS) {
+			const name = `${this.prefix}c${chunk_names.length}`;
+			puts.push({ name, data: pack_events(events.slice(sealed, sealed + CHUNK_EVENTS)) });
+			chunk_names.push(name);
+			sealed += CHUNK_EVENTS;
 		}
-		const tail = pack_events(events.slice(this.sealed, count));
+		// A stroke under way (the page is being hidden): the copy ends it where the pointer is now, so a replay of the
+		// copy has the stroke as drawn so far. Its picture isn't known until that replay, so the copy has no hash.
+		const closing = open_stroke_ends(recorder, events);
+		const tail = pack_events(closing.length ? [...events.slice(sealed, count), ...closing] : events.slice(sealed, count));
 		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-		const hash = hash_image_data(image_data);
+		const hash = closing.length ? null : hash_image_data(image_data);
 		const info = segment_info(recorder.segment);
 		info.duration = Math.max(recorder.last_t, Math.round(recorder.now()));
-		info.end = { hash, width: image_data.width, height: image_data.height };
+		if (hash != null) {
+			info.end = { hash, width: image_data.width, height: image_data.height };
+		} else {
+			delete info.end;
+		}
 		const sync_ms = performance.now() - start;
 
 		const saved = Date.now();
@@ -475,10 +584,11 @@ export class Autosaver {
 			width: image_data.width,
 			height: image_data.height,
 			hash,
-			segments: [...this.previous_stored, { info, chunks: this.chunk_names.slice(), tail }],
-			blobs: this.blob_names.slice(),
+			segments: [...previous_stored, { info, chunks: chunk_names, tail }],
+			blobs: blob_names,
 			snapshot: this.snapshot,
-			events: recorder.previous_segments.reduce((n, s) => n + s.events.length, 0) + count,
+			events: recorder.previous_segments.reduce((n, s) => n + s.events.length, 0) + count + closing.length,
+			open_stroke: closing.length > 0,
 		};
 
 		const db = await open_db();
@@ -492,19 +602,24 @@ export class Autosaver {
 		}
 		tx.objectStore(DRAFTS).put(meta);
 		await done(tx);
+		this.previous_stored = previous_stored;
+		this.blob_names = blob_names;
+		this.chunk_names = chunk_names;
+		this.sealed = sealed;
+		this.ever_saved = true;
 		this.saved_events = count;
 		this.saved_blobs = recorder.blobs.length;
 		const bytes = puts.reduce((n, p) => n + p.data.byteLength, 0) + tail.byteLength;
 		const ms = performance.now() - start;
 		this.saves++;
-		this.last_stats = { at: saved, ms: Math.round(ms * 10) / 10, sync_ms: Math.round(sync_ms * 10) / 10, bytes, events: meta.events, chunks: this.chunk_names.length, tail: tail.byteLength };
-		console.log(`[autosave] saved on this device: ${meta.events} events, wrote ${bytes} bytes in ${this.last_stats.ms} ms (${this.last_stats.sync_ms} ms on the main thread)`);
+		this.last_stats = { at: saved, ms: Math.round(ms * 10) / 10, sync_ms: Math.round(sync_ms * 10) / 10, bytes, events: meta.events, chunks: this.chunk_names.length, tail: tail.byteLength, open_stroke: closing.length > 0 };
+		console.log(`[autosave] saved on this device: ${meta.events} events${closing.length ? " (mid-stroke)" : ""}, wrote ${bytes} bytes in ${this.last_stats.ms} ms (${this.last_stats.sync_ms} ms on the main thread)`);
 		try {
 			this.onsaved?.({ at: saved, ms, bytes });
 		} catch (error) {
 			console.error("draftSaved failed", error);
 		}
-		if (hash !== this.snapshot?.hash && (!this.snapshot || saved - this.snapshot.at >= SNAPSHOT_INTERVAL_MS || document.visibilityState === "hidden")) {
+		if (hash != null && hash !== this.snapshot?.hash && (!this.snapshot || saved - this.snapshot.at >= SNAPSHOT_INTERVAL_MS || document.visibilityState === "hidden")) {
 			this.take_snapshot(hash);
 		}
 	}
@@ -558,9 +673,162 @@ export class Autosaver {
 			this.timer = 0;
 			this.deleting = Promise.all([this.saving, this.snapshotting]).catch(() => { }).then(() => delete_draft(this.key));
 			this.deleting.then(() => console.log("[autosave] deleted the device copy"), () => { this.deleting = null; });
+			this.report();
 		}
 		return this.deleting;
 	}
+}
+
+/**
+ * Events that end the strokes under way where each pointer is now: a pointer up per pointer still down, for a copy
+ * saved mid-stroke (the recorder itself carries on with the real events).
+ * @param {import("./paint95-record.js").Recorder} recorder
+ * @param {any[][]} events
+ * @returns {any[][]}
+ */
+export function open_stroke_ends(recorder, events) {
+	if (!recorder.active_pointers.size) {
+		return [];
+	}
+	const ends = [];
+	for (const id of recorder.active_pointers) {
+		// the last position: its latest down ["d", dt, id, target, x, y, …] or move ["m"/"M", dt, id, x, y, …]
+		let x = 0;
+		let y = 0;
+		for (let i = events.length - 1; i >= 0; i--) {
+			const event = events[i];
+			if (event[2] !== id) {
+				continue;
+			}
+			if (event[0] === "m" || event[0] === "M") {
+				[x, y] = [event[3], event[4]];
+				break;
+			}
+			if (event[0] === "d") {
+				[x, y] = [event[4], event[5]];
+				break;
+			}
+		}
+		ends.push(["u", 0, id, x, y, 0, 0, 0]);
+	}
+	return ends;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * One editor per draft on this device (two tabs, or a tab and the iOS app's web view). The editor holds the Web
+ * Lock "paint95-draft-edit:<key>" while it is open. A new one that finds it held posts "take" on
+ * BroadcastChannel("paint95-draft:<key>"); the holder answers "taking", saves (ontake), lets go and posts
+ * "released". The new one waits for that (4 s at most, then steals the lock from a tab that never answers), and only
+ * then reads the device copy, so it starts from everything the other tab drew. Without Web Locks the message alone
+ * does it: with no answer in 250 ms nobody else has it open. Modelled on Lascaux Pocket's (2draw.net
+ * worker/src/pocket/ink.ts, "one editor at a time").
+ * @param {string} key
+ * @param {() => Promise<void>} ontake - another tab takes over: save, stop saving, say so; given 2 s at most
+ * @returns {Promise<{ lost: boolean }>} once this tab is the editor
+ */
+export async function take_edit_lock(key, ontake) {
+	const tab = make_session_id();
+	const handle = { lost: false, held: false };
+	/** @type {(() => void) | null} */
+	let release = null;
+	/** @type {(() => void) | null} */
+	let answered = null;
+	/** @type {(() => void) | null} */
+	let released = null;
+	/** @type {BroadcastChannel | null} */
+	let channel = null;
+	try {
+		channel = new BroadcastChannel(`paint95-draft:${key}`);
+	} catch (_error) { /* no BroadcastChannel */ }
+	const post = (t) => {
+		try {
+			channel?.postMessage({ t, from: tab });
+		} catch (_error) { /* closed */ }
+	};
+	const give_up = async () => {
+		if (handle.lost) {
+			return;
+		}
+		handle.lost = true;
+		try {
+			await Promise.race([ontake(), sleep(2000)]);
+		} catch (error) {
+			console.error("[autosave] couldn't hand the drawing over", error);
+		}
+		release?.();
+		release = null;
+		post("released");
+	};
+	channel?.addEventListener("message", (e) => {
+		const m = e.data || {};
+		if (m.from === tab) {
+			return;
+		}
+		if (m.t === "take" && handle.held && !handle.lost) {
+			post("taking");
+			give_up();
+		} else if (m.t === "taking") {
+			answered?.();
+		} else if (m.t === "released") {
+			released?.();
+		}
+	});
+	const locks = navigator.locks;
+	if (!locks || !locks.request) {
+		if (channel) {
+			const yes = await new Promise((resolve) => {
+				answered = () => resolve(true);
+				setTimeout(() => resolve(false), 250);
+				post("take");
+			});
+			if (yes) {
+				await Promise.race([new Promise((resolve) => { released = () => resolve(undefined); }), sleep(4000)]);
+			}
+			answered = released = null;
+		}
+		handle.held = true;
+		return handle;
+	}
+	/** @type {() => void} */
+	let let_go = () => { };
+	const held = new Promise((resolve) => { let_go = () => resolve(undefined); });
+	const name = `paint95-draft-edit:${key}`;
+	/** @param {LockOptions} options */
+	const request = (options) => new Promise((granted) => {
+		let mine = false;
+		locks.request(name, options, (lock) => {
+			if (!lock) {
+				granted(false);
+				return undefined;
+			}
+			mine = true;
+			granted(true);
+			return held;
+		}).catch(() => {
+			// stolen (by a tab that waited 4 s), or our own wait ran out
+			if (mine) {
+				give_up();
+			} else {
+				granted(false);
+			}
+		});
+	});
+	if (!(await request({ ifAvailable: true }))) {
+		post("take");
+		const abort = new AbortController();
+		const timer = setTimeout(() => abort.abort(), 4000);
+		const got = await request({ signal: abort.signal });
+		clearTimeout(timer);
+		if (!got) {
+			console.warn("[autosave] the other tab didn't let go of the drawing; taking it");
+			await request({ steal: true });
+		}
+	}
+	release = let_go;
+	handle.held = true;
+	return handle;
 }
 
 /** Asks once per device for storage that the browser won't evict. Never asks the member anything itself. */

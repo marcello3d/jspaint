@@ -8,7 +8,9 @@
 // draws, waits for the save, reloads, opens the draft in a fresh tab, checks the picture and undo history come back
 // and the recording carries on; submits and checks the device copy is gone and the .p95 replays in player.js to the
 // submitted picture. Also: a revision (load= + anim=) draft, a size mismatch, a drifting replay (snapshot fallback),
-// expiry, and save time and size on a long drawing.
+// expiry, and save time and size on a long drawing. And: the leave question (drawGuard, drawPersists, drawUnchanged),
+// a save mid-stroke when the page is hidden, a failing store ("Not saved", retried), and one editor per draft (two
+// tabs: the newer takes over, the older says so and can take it back).
 
 import fs from "node:fs";
 import http from "node:http";
@@ -113,6 +115,9 @@ function host_html(query) {
 	<script>
 		window.submissions = [];
 		window.saves = [];
+		window.fails = 0;
+		window.guards = [];
+		window.drawGuard = (on) => { window.guards.push(on); };
 		window.paint95Host = {
 			async submit(png, extra) {
 				const read = (blob) => blob.arrayBuffer().then((b) => Array.from(new Uint8Array(b)));
@@ -121,7 +126,7 @@ function host_html(query) {
 				if (extra && extra.uploaded) await extra.uploaded();
 				window.submissions.push(entry);
 			},
-			draftSaved(info) { window.saves.push(info.at); },
+			draftSaved(info) { if (info.failed) window.fails++; else window.saves.push(info.at); },
 		};
 	</script>
 	<iframe src="/app/index.html?${query}" style="border:0;width:1000px;height:680px"></iframe>`;
@@ -421,6 +426,7 @@ try {
 				tx.objectStore("drafts").put({ key: "old31days", v: 1, saved: Date.now() - 31 * day, segments: [], blobs: [] });
 				tx.objectStore("parts").put({ key: "old31days", name: "x:c0", data: new Uint8Array(10) });
 				tx.objectStore("drafts").put({ key: "recent29days", v: 1, saved: Date.now() - 29 * day, segments: [], blobs: [] });
+				tx.objectStore("drafts").put({ key: "aside~unreadable-1", v: 1, saved: Date.now() - 31 * day, aside_at: Date.now() - day, set_aside: true, segments: [], blobs: [] });
 				tx.oncomplete = () => { request.result.close(); resolve(); };
 			};
 		}));
@@ -429,7 +435,9 @@ try {
 		await wait_until(frame, () => !!(window.P95 && window.P95.recorder && window.paint95_autosaver));
 		const old = await draft_record(frame, "old31days");
 		const recent = await draft_record(frame, "recent29days");
+		const aside = await draft_record(frame, "aside~unreadable-1");
 		check(old.none && old.parts === 0 && !recent.none, "expire: copies older than 30 days are deleted when the editor loads, newer ones kept");
+		check(!aside.none, "expire: a copy set aside a day ago is kept, though last saved 31 days ago");
 		await page.close();
 	}
 
@@ -442,6 +450,121 @@ try {
 		await wait_until(frame, () => !!(window.P95 && window.P95.recorder));
 		check(await frame.evaluate(() => !window.paint95_autosaver), "no key: no autosave");
 		await page.close();
+	}
+
+	// ---- 8. the leave question, mid-stroke saves, a failing store -------------------------------------------------------
+	{
+		const W = 200, H = 150;
+		const key = "autosavetest8";
+		const url = host_url(`w=${W}&h=${H}&draft=${key}`);
+		let page = await context.newPage();
+		watch(page, "leave");
+		let frame = await open_editor(page, url);
+		const leave = () => page.evaluate(() => ({ persists: window.drawPersists, unchanged: window.drawUnchanged, guard: window.guards[window.guards.length - 1], flush: typeof window.drawFlush }));
+		let state = await leave();
+		check(state.persists === false && state.unchanged === true && state.guard === false && state.flush === "function", `leave: nothing drawn: no question (${JSON.stringify(state)})`);
+		await draw(page, frame, "Pencil", [[20, 20], [60, 40], [100, 30]], W);
+		state = await leave();
+		check(state.guard === true && state.unchanged === false, `leave: a change not saved yet asks (${JSON.stringify(state)})`);
+		await wait_saved(page, 0);
+		await wait_until(page, () => window.drawPersists === true && window.guards[window.guards.length - 1] === false, null, 3000);
+		check(true, "leave: saved: persists, and the warning is off");
+
+		// mid-stroke: press, move, hide the page without letting go
+		const box = await (await frame.$(".main-canvas")).boundingBox();
+		const scale = box.width / W;
+		await frame.click(`.tools-component .tool[title="Pencil"]`);
+		await page.mouse.move(box.x + 30 * scale, box.y + 100 * scale);
+		await page.mouse.down();
+		await page.mouse.move(box.x + 150 * scale, box.y + 120 * scale, { steps: 8 });
+		check((await leave()).guard === true, "leave: a stroke under way asks");
+		let n = await page.evaluate(() => window.saves.length);
+		await frame.evaluate(() => {
+			Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+		await wait_saved(page, n);
+		const open_stats = await frame.evaluate(() => window.paint95_autosaver.last_stats);
+		check(open_stats.open_stroke === true, `hidden mid-stroke: saved up to the stroke under way (${JSON.stringify(open_stats)})`);
+		// what the picture is with that stroke ended there (no more saves from this page)
+		await frame.evaluate(() => { window.paint95_autosaver.disabled = true; });
+		await page.mouse.up();
+		const expected = await editor_state(frame);
+		await page.close();
+		page = await context.newPage();
+		watch(page, "leave/mid-stroke");
+		frame = await open_editor(page, url);
+		let after = await editor_state(frame);
+		check(after.hash === expected.hash && after.undos === expected.undos, `hidden mid-stroke: a fresh tab restores the stroke as far as it went (${after.undos} vs ${expected.undos} steps)`);
+		state = await leave();
+		check(state.persists === true && state.guard === false, `leave: a restored copy persists (${JSON.stringify(state)})`);
+
+		// a failing store: "Not saved", the warning stays on; it works again once the store does
+		await frame.evaluate(() => {
+			window.__put = IDBObjectStore.prototype.put;
+			IDBObjectStore.prototype.put = function () { throw new DOMException("The quota has been exceeded.", "QuotaExceededError"); };
+		});
+		n = await page.evaluate(() => window.saves.length);
+		await draw(page, frame, "Pencil", [[20, 130], [180, 130]], W);
+		await wait_until(page, () => window.fails > 0, null, 5000);
+		state = await leave();
+		check(state.persists === false && state.guard === true, `failing store: the host hears "not saved", and the leave warning stays on (${JSON.stringify(state)})`);
+		await new Promise((r) => setTimeout(r, 2500));
+		check((await page.evaluate(() => window.saves.length)) === n, "failing store: no \"saved\" while it fails");
+		await frame.evaluate(() => { IDBObjectStore.prototype.put = window.__put; });
+		await wait_saved(page, n);
+		await wait_until(page, () => window.drawPersists === true && window.guards[window.guards.length - 1] === false, null, 3000);
+		const expected2 = await editor_state(frame);
+		await page.close();
+		page = await context.newPage();
+		watch(page, "leave/after-failure");
+		frame = await open_editor(page, url);
+		after = await editor_state(frame);
+		check(after.hash === expected2.hash && after.undos === expected2.undos, `failing store: the retried save holds everything (${after.undos} vs ${expected2.undos} steps)`);
+		await frame.evaluate(() => window.paint95_autosaver.delete());
+		await page.close();
+	}
+
+	// ---- 9. one editor per draft: two tabs ----------------------------------------------------------------------------
+	{
+		const W = 200, H = 150;
+		const key = "autosavetest9";
+		const url = host_url(`w=${W}&h=${H}&draft=${key}`);
+		const a = await context.newPage();
+		watch(a, "tabs/A");
+		let fa = await open_editor(a, url);
+		await draw(a, fa, "Pencil", [[20, 20], [100, 60]], W);
+		await wait_saved(a, 0);
+		// a stroke not saved yet (no 1.5 s wait), then the second tab
+		await draw(a, fa, "Pencil", [[20, 100], [150, 100]], W);
+		const a_state = await editor_state(fa);
+		const b = await context.newPage();
+		watch(b, "tabs/B");
+		const t0 = Date.now();
+		const fb = await open_editor(b, url);
+		const b_state = await editor_state(fb);
+		check(b_state.hash === a_state.hash && b_state.undos === a_state.undos, `tabs: the new tab starts from everything the old one drew (${b_state.undos} vs ${a_state.undos} steps, ${Date.now() - t0} ms)`);
+		await wait_until(fa, () => !!document.getElementById("paint95-taken") && window.paint95_autosaver.yielded, null, 5000);
+		check(await a.evaluate(() => window.drawPersists === true && window.guards[window.guards.length - 1] === false), "tabs: the old tab is covered, stops saving, and asks nothing on leaving");
+		// the old tab can't draw under its cover
+		const undos_before = await fa.evaluate(() => undos.length);
+		const box = await (await fa.$(".main-canvas")).boundingBox();
+		await a.mouse.click(box.x + 10, box.y + 10);
+		check((await fa.evaluate(() => undos.length)) === undos_before, "tabs: the cover blocks drawing");
+		// the new tab draws; Continue here in the old one takes it back, with that stroke
+		await draw(b, fb, "Pencil", [[20, 140], [180, 10]], W);
+		const b_state2 = await editor_state(fb);
+		await fa.click("#paint95-taken button");
+		await a.waitForLoadState("load");
+		fa = await (await a.waitForSelector("iframe")).contentFrame();
+		await wait_until(fa, () => !!(window.P95 && window.P95.recorder && window.paint95_autosaver), null, 15000);
+		const a_state2 = await editor_state(fa);
+		check(a_state2.hash === b_state2.hash && a_state2.undos === b_state2.undos, `tabs: Continue here takes it back with the other tab's strokes (${a_state2.undos} vs ${b_state2.undos} steps)`);
+		await wait_until(fb, () => !!document.getElementById("paint95-taken"), null, 5000);
+		check(true, "tabs: and the other tab is covered now");
+		await fa.evaluate(() => window.paint95_autosaver.delete());
+		await a.close();
+		await b.close();
 	}
 
 	// ---- 7. save time and size on a long drawing ------------------------------------------------------------------------

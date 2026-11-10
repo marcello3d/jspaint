@@ -209,19 +209,35 @@ back/forward, or `/draw/<key>/` in a new tab. Without the parameter nothing is s
   - DB `2draw-paint95-drafts`, store `drafts` (key `key`): `{ key, v: 1, tool: "paint95", saved (ms), session,
     required: { width, height } (the w/h it was opened with), width, height, hash (canvas at the save), truncated,
     segments: [{ info (segment header without events), chunks: [part names], tail (deflated events) }],
-    blobs: [part names], snapshot: { name, hash, at } | null, events }`.
+    blobs: [part names], snapshot: { name, hash, at } | null, events, open_stroke }`. A copy set aside also has
+    `set_aside: true, aside_at (ms)`.
   - store `parts` (key `[key, name]`): `<session>:c<n>`: a sealed chunk of 2048 events of the session's segment,
     deflated `encode_events` output, written once; `<session>:p<n>`: an earlier segment (a revision's posted recording),
     written once on the first save; `<session>:b<n>`: blob `n` as PNG, written once (the recorder then keeps it as PNG,
     so `finalize()` doesn't encode it again); `<session>:snap`: a PNG of the canvas.
   - Chunks are encoded independently, so decoding each and concatenating the events gives back the segment's events.
-    `session` is random per page load, so two tabs on one draft never overwrite each other's pieces (the last save wins).
+    `session` is random per page load, so two pages on one draft never overwrite each other's pieces.
 - **Saving.** About 1.5 s after the last recorded event (the recorder's `onchange`), in idle time, never while a pointer
-  is down or a recorded event is being dispatched; at once when the page is hidden (`visibilitychange`, `pagehide`). A
-  save rewrites the record (with the tail: the events since the last sealed chunk) and adds any new chunks and blobs.
+  is down or a recorded event is being dispatched; at once when the page is hidden (`visibilitychange`, `pagehide`),
+  even mid-stroke: on iOS a page hidden by a swipe back may never be shown again. A mid-stroke copy ends each stroke
+  under way with a pointer up (`["u", 0, id, x, y, 0, 0, 0]`, at its last position) in the stored tail only (the live
+  recording carries on with the real events), and has no `hash` and no segment `end` (`open_stroke: true`): its picture
+  is whatever the replay ends on, and the restored session fills `end` in from it. A save rewrites the record (with the
+  tail: the events since the last sealed chunk) and adds any new chunks and blobs, in one transaction; what it adds
+  counts only once that is done. A failed save (`QuotaExceededError`, a broken store) is announced
+  (`draftSaved({ failed: true })`, the page says "Not saved"), and tried again at the next change and every 5 s.
   The snapshot is encoded with `toBlob` (off the main thread) and written afterwards in its own transaction, at most
   every 20 s and when the page is hidden. Each save is announced to the page (`paint95Host.draftSaved({ at })`, else
   `postMessage({ type: "2draw:draft-saved", at })`). The first save asks once per device for `navigator.storage.persist()`.
+- **The page's leave question.** The editor sets, on the same-origin parent: `drawPersists` (a copy is on this device
+  and saving works: the draw bar's Close needn't ask), `drawUnchanged` (nothing drawn and no copy: nothing to lose),
+  `drawGuard(on)` (its leave warning: on while a change is unsaved, a save or a stroke is under way, a save failed, or
+  before the first save of a drawing with changes) and `drawFlush()` (save now; Close waits for it).
+- **One editor per draft.** Before reading the copy, the editor takes the Web Lock `paint95-draft-edit:<key>`. If
+  another page holds it, it posts `take` on `BroadcastChannel("paint95-draft:<key>")`; the holder answers `taking`,
+  saves (mid-stroke too), stops saving, covers itself ("This drawing is open in another tab", Continue here reloads it
+  and takes the drawing back) and lets go. The new page waits for that (4 s at most, then steals the lock), so it reads
+  everything the other drew. Without Web Locks, the message alone (no answer in 250 ms: nobody else has it).
 - **Restoring.** The draft is replayed like a revision's previous recording (Restoring the undo history, above), and it
   wins over `load`/`anim`: they are not fetched. The replay should end on the record's `hash`; if it doesn't, and the
   snapshot was taken at that save (`snapshot.hash === hash`), the snapshot is set as one more step (`snap: true` with an
@@ -229,8 +245,8 @@ back/forward, or `/draw/<key>/` in a new tab. Without the parameter nothing is s
   every reload adds a segment. If the saved `required` size differs from `w`/`h`, the editor asks first (Restore / Start
   over). An unreadable draft, or one set aside by Start over, is moved to `<key>~unreadable-<time>`, not deleted.
 - **Deleting.** `submit`'s `extra.uploaded()` (called by the host once the server has accepted the upload, before it
-  leaves) deletes the draft; so does the editor itself once `submit` resolves. Drafts not saved for 30 days are deleted
-  whenever the editor loads.
+  leaves) deletes the draft; so does the editor itself once `submit` resolves. Drafts not saved (or set aside) for 30
+  days are deleted whenever the editor loads.
 
 ### Loading `load` and `anim`
 
