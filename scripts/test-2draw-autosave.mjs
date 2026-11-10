@@ -10,7 +10,8 @@
 // submitted picture. Also: a revision (load= + anim=) draft, a size mismatch, a drifting replay (snapshot fallback),
 // expiry, and save time and size on a long drawing. And: the leave question (drawGuard, drawPersists, drawUnchanged),
 // a save mid-stroke when the page is hidden, a failing store ("Not saved", retried), and one editor per draft (two
-// tabs: the newer takes over, the older says so and can take it back).
+// tabs: the newer takes over, the older says so and can take it back). And iOS (WebKit's back/forward cache): drawing
+// without a pause still saves, and a page going into that cache starts no transaction until it is shown again.
 
 import fs from "node:fs";
 import http from "node:http";
@@ -231,7 +232,7 @@ try {
 		const t0 = Date.now();
 		let saves = await wait_saved(page, 0);
 		const waited = Date.now() - t0;
-		check(waited < 5000, `new: saved about 1.5 s after the last stroke (${waited} ms)`);
+		check(waited < 5000, `new: saved soon after drawing (${waited} ms)`);
 		const before = await editor_state(frame);
 		const record = await draft_record(frame, key);
 		check(!record.none && record.events > 10, `new: the device copy is in IndexedDB (${JSON.stringify(record)})`);
@@ -433,6 +434,8 @@ try {
 		await page.reload();
 		frame = await (await page.waitForSelector("iframe")).contentFrame();
 		await wait_until(frame, () => !!(window.P95 && window.P95.recorder && window.paint95_autosaver));
+		// (old copies go after the drawing's own copy is read, not before)
+		for (let i = 0; i < 40 && !(await draft_record(frame, "old31days")).none; i++) await new Promise((r) => setTimeout(r, 50));
 		const old = await draft_record(frame, "old31days");
 		const recent = await draft_record(frame, "recent29days");
 		const aside = await draft_record(frame, "aside~unreadable-1");
@@ -535,7 +538,7 @@ try {
 		let fa = await open_editor(a, url);
 		await draw(a, fa, "Pencil", [[20, 20], [100, 60]], W);
 		await wait_saved(a, 0);
-		// a stroke not saved yet (no 1.5 s wait), then the second tab
+		// a stroke not saved yet (no wait for its save), then the second tab
 		await draw(a, fa, "Pencil", [[20, 100], [150, 100]], W);
 		const a_state = await editor_state(fa);
 		const b = await context.newPage();
@@ -565,6 +568,69 @@ try {
 		await fa.evaluate(() => window.paint95_autosaver.delete());
 		await a.close();
 		await b.close();
+	}
+
+	// ---- 10. iOS: saves while drawing without a pause; nothing starts in the back/forward cache ------------------------
+	{
+		const W = 200, H = 150;
+		const key = "autosavetest10";
+		const url = host_url(`w=${W}&h=${H}&draft=${key}`);
+		let page = await context.newPage();
+		watch(page, "ios");
+		let frame = await open_editor(page, url);
+		await frame.click(`.tools-component .tool[title="Pencil"]`);
+		const box = await (await frame.$(".main-canvas")).boundingBox();
+		const scale = box.width / W;
+		// strokes back to back for 3 s, never pausing: a save is due 0.7 s after the first one, and isn't put off
+		const t0 = Date.now();
+		let first_save_at = 0;
+		for (let s = 0; Date.now() - t0 < 3000; s++) {
+			const y = 10 + (s * 13) % (H - 20);
+			await page.mouse.move(box.x + 10 * scale, box.y + y * scale);
+			await page.mouse.down();
+			await page.mouse.move(box.x + 190 * scale, box.y + ((y + 40) % H) * scale, { steps: 6 });
+			await page.mouse.up();
+			if (!first_save_at && (await page.evaluate(() => window.saves.length)) > 0) first_save_at = Date.now() - t0;
+		}
+		check(first_save_at > 0 && first_save_at < 1800, `ios: drawing without a pause still saves, ${first_save_at} ms after the first stroke`);
+		const saves_while_drawing = await page.evaluate(() => window.saves.length);
+		check(saves_while_drawing >= 2, `ios: and keeps saving while drawing goes on (${saves_while_drawing} saves in 3 s)`);
+		await wait_until(frame, () => !window.paint95_autosaver.state().pending, null, 5000);
+
+		// the page goes into the back/forward cache (a swipe back): nothing new starts, the connection is closed
+		await frame.evaluate(() => {
+			window.__tx_started = 0;
+			const transaction = IDBDatabase.prototype.transaction;
+			IDBDatabase.prototype.transaction = function (...args) {
+				window.__tx_started++;
+				return transaction.apply(this, args);
+			};
+			dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+			Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+		// a change that would be saved (as a stroke would be, if the page went before its save)
+		await frame.evaluate(() => window.paint95_autosaver.changed());
+		await new Promise((r) => setTimeout(r, 1500));
+		let away = await frame.evaluate(() => ({ started: window.__tx_started, dirty: window.paint95_autosaver.dirty, failed: window.paint95_autosaver.failed }));
+		check(away.started === 0 && away.dirty && !away.failed, `ios: in the back/forward cache no transaction starts, and nothing fails (${JSON.stringify(away)})`);
+		const n = await page.evaluate(() => window.saves.length);
+		await frame.evaluate(() => {
+			Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+			dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+		});
+		await wait_saved(page, n);
+		away = await frame.evaluate(() => ({ started: window.__tx_started, dirty: window.paint95_autosaver.dirty }));
+		check(away.started > 0 && !away.dirty, `ios: shown again, what it held is saved (${JSON.stringify(away)})`);
+		const expected = await editor_state(frame);
+		await page.close();
+		page = await context.newPage();
+		watch(page, "ios/reopen");
+		frame = await open_editor(page, url);
+		const after = await editor_state(frame);
+		check(after.hash === expected.hash && after.undos === expected.undos, `ios: reopened, everything is back (${after.undos} vs ${expected.undos} steps)`);
+		await frame.evaluate(() => window.paint95_autosaver.delete());
+		await page.close();
 	}
 
 	// ---- 7. save time and size on a long drawing ------------------------------------------------------------------------
@@ -597,6 +663,9 @@ try {
 			const saver = window.paint95_autosaver;
 			const recorder = window.P95.recorder;
 			recorder.onchange = null; // measuring by hand
+			await saver.flush(); // (nothing of the strokes' own saves still under way)
+			clearTimeout(saver.timer);
+			saver.timer = 0;
 			recorder.segment.events.push(...events);
 			const runs = [];
 			const t_first = performance.now();

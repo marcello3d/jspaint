@@ -217,9 +217,17 @@ back/forward, or `/draw/<key>/` in a new tab. Without the parameter nothing is s
     so `finalize()` doesn't encode it again); `<session>:snap`: a PNG of the canvas.
   - Chunks are encoded independently, so decoding each and concatenating the events gives back the segment's events.
     `session` is random per page load, so two pages on one draft never overwrite each other's pieces.
-- **Saving.** About 1.5 s after the last recorded event (the recorder's `onchange`), in idle time, never while a pointer
-  is down or a recorded event is being dispatched; at once when the page is hidden (`visibilitychange`, `pagehide`),
-  even mid-stroke: on iOS a page hidden by a swipe back may never be shown again. A mid-stroke copy ends each stroke
+- **Saving.** 0.7 s after the first recorded event since the last save (the recorder's `onchange`), and later events
+  don't put it off, so drawing without a pause still saves; never while a pointer is down or a recorded event is being
+  dispatched (a save due then runs as the pen lifts). The copy has to be current before the page is left, not when it
+  is: WebKit (Safari, the iOS app) freezes a page in its back/forward cache right after `pagehide` (a swipe back), and
+  an IndexedDB write begun then never runs. So a page going into that cache (`pagehide` with `persisted`, and the
+  `visibilitychange` after it) starts no transaction until `pageshow`, aborts one still making requests and closes its
+  connection; it saves what it held when shown again. A page hidden otherwise (the app switcher, another tab:
+  `visibilitychange`; or `pagehide` for good) saves at once, even mid-stroke. Every transaction is committed
+  (`commit()`) as soon as its last request is made: one left open in a frozen page held the store, and the same drawing
+  opened again waited behind it for minutes. A transaction that fails is tried again on a fresh connection (after
+  0.25, 1 and 3 s) before it counts as failed. The editor reads its copy first, and only then drops old ones. A mid-stroke copy ends each stroke
   under way with a pointer up (`["u", 0, id, x, y, 0, 0, 0]`, at its last position) in the stored tail only (the live
   recording carries on with the real events), and has no `hash` and no segment `end` (`open_stroke: true`): its picture
   is whatever the replay ends on, and the restored session fills `end` in from it. A save rewrites the record (with the

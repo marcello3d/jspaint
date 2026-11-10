@@ -26,8 +26,11 @@ const PARTS = "parts";
 export const DRAFT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Events per sealed chunk */
 export const CHUNK_EVENTS = 2048;
-/** Save this long after the last change */
-export const SAVE_DELAY_MS = 1500;
+/** A save is due this long after the first change since the last save; later changes don't put it off (see "When
+ * to save" below). */
+export const SAVE_DELAY_MS = 700;
+/** A store that failed is tried again after these waits (a fresh connection each time) before a save says it failed */
+export const DB_RETRY_MS = [250, 1000, 3000];
 /** A new snapshot at most this often (and when the page is hidden) */
 export const SNAPSHOT_INTERVAL_MS = 20000;
 /** After a failed save, try again this long after (and at every change) */
@@ -40,40 +43,217 @@ export function valid_draft_key(key) {
 }
 
 // #region IndexedDB
+// Every transaction is committed as soon as its last request is made (commit_tx), never left to commit by itself:
+// WebKit (Safari, the iOS app) puts a page that is left into its back/forward cache right after pagehide and freezes
+// it there, and a frozen page with a transaction still open holds the store, so the same drawing opened again waited
+// behind it until the frozen page was thrown away, minutes later. So, too, as Lascaux Pocket does (2draw.net
+// worker/src/pocket/ink.ts, "The device's store"): a page going into that cache (pagehide, persisted) starts no new
+// transaction until it is shown again (page_away), aborts any still waiting on its own requests (open_tx) and closes
+// its connection (opened again when next needed). A transaction that fails is tried again on a fresh connection
+// (DB_RETRY_MS) before anyone says "Not saved".
 
 /** @type {Promise<IDBDatabase> | null} */
 let db_promise = null;
+/** @type {IDBDatabase | null} */
+let db_connection = null;
+/** @type {Promise<void> | null} the page is in the back/forward cache: resolves when it is shown again */
+let page_away = null;
+/** @type {(() => void) | null} */
+let page_back = null;
+/** @type {Set<IDBTransaction>} transactions still making requests (from callbacks): aborted if the page goes away */
+const open_tx = new Set();
+/** @type {Set<() => void>} called when the page comes back from the back/forward cache */
+const on_page_back = new Set();
+
+/** Whether the page is in the back/forward cache (nothing is started then) */
+export function is_page_away() {
+	return !!page_away;
+}
+
+/** Thrown for a transaction aborted because the page went into the back/forward cache: not a failure */
+export class PageAwayError extends Error {
+	constructor() {
+		super("the page went into the back/forward cache");
+		this.name = "PageAwayError";
+	}
+}
+
+/** @param {IDBTransaction} tx */
+export function commit_tx(tx) {
+	// (commit(): Safari 15+, Chrome 76+; older ones commit by themselves)
+	const commit = /** @type {any} */ (tx).commit;
+	if (typeof commit === "function") {
+		try {
+			commit.call(tx);
+		} catch (_error) { /* already finishing */ }
+	}
+}
+
+/** @param {IDBDatabase} db */
+function drop_db(db) {
+	try {
+		db.close();
+	} catch (_error) { /* closed */ }
+	if (db_connection === db) {
+		db_connection = null;
+		db_promise = null;
+	}
+}
+
+if (typeof addEventListener === "function") {
+	addEventListener("pagehide", (event) => {
+		if (!(/** @type {PageTransitionEvent} */ (event).persisted)) {
+			return;
+		}
+		page_away ??= new Promise((resolve) => { page_back = () => resolve(undefined); });
+		for (const tx of open_tx) {
+			try {
+				tx.abort();
+			} catch (_error) { /* finished */ }
+		}
+		open_tx.clear();
+		if (db_connection) {
+			drop_db(db_connection);
+		}
+	});
+	addEventListener("pageshow", () => {
+		if (!page_away) {
+			return;
+		}
+		page_away = null;
+		page_back?.();
+		page_back = null;
+		for (const fn of on_page_back) {
+			try {
+				fn();
+			} catch (error) {
+				console.error("[autosave] pageshow handler failed", error);
+			}
+		}
+	});
+}
+
+/** @returns {Promise<IDBDatabase>} */
+function open_db_once() {
+	return new Promise((resolve, reject) => {
+		if (typeof indexedDB === "undefined") {
+			reject(new Error("IndexedDB is not available"));
+			return;
+		}
+		const request = indexedDB.open(DB_NAME, DB_VERSION);
+		request.onupgradeneeded = () => {
+			const db = request.result;
+			if (!db.objectStoreNames.contains(DRAFTS)) {
+				db.createObjectStore(DRAFTS, { keyPath: "key" });
+			}
+			if (!db.objectStoreNames.contains(PARTS)) {
+				db.createObjectStore(PARTS, { keyPath: ["key", "name"] });
+			}
+		};
+		request.onsuccess = () => {
+			const db = request.result;
+			// another tab upgrading: let it
+			db.onversionchange = () => drop_db(db);
+			/** @type {any} */ (db).onclose = () => drop_db(db);
+			db_connection = db;
+			resolve(db);
+		};
+		request.onerror = () => reject(request.error);
+		request.onblocked = () => console.warn("[autosave] the device store's open is waiting on another page");
+	});
+}
 
 /** @returns {Promise<IDBDatabase>} */
 export function open_db() {
 	if (!db_promise) {
-		db_promise = new Promise((resolve, reject) => {
-			if (typeof indexedDB === "undefined") {
-				reject(new Error("IndexedDB is not available"));
-				return;
+		db_promise = (async () => {
+			for (let i = 0; ; i++) {
+				try {
+					return await open_db_once();
+				} catch (error) {
+					if (i >= DB_RETRY_MS.length || typeof indexedDB === "undefined") {
+						throw error;
+					}
+					await sleep(DB_RETRY_MS[i]);
+				}
 			}
-			const request = indexedDB.open(DB_NAME, DB_VERSION);
-			request.onupgradeneeded = () => {
-				const db = request.result;
-				if (!db.objectStoreNames.contains(DRAFTS)) {
-					db.createObjectStore(DRAFTS, { keyPath: "key" });
-				}
-				if (!db.objectStoreNames.contains(PARTS)) {
-					db.createObjectStore(PARTS, { keyPath: ["key", "name"] });
-				}
-			};
-			request.onsuccess = () => {
-				const db = request.result;
-				// another tab upgrading: let it
-				db.onversionchange = () => { db.close(); db_promise = null; };
-				resolve(db);
-			};
-			request.onerror = () => reject(request.error);
-			request.onblocked = () => reject(new Error("IndexedDB open blocked"));
-		});
+		})();
 		db_promise.catch(() => { db_promise = null; });
 	}
 	return db_promise;
+}
+
+/** @param {any} error */
+const retryable = (error) => !(error instanceof PageAwayError) && !(error && ["QuotaExceededError", "DataError", "DataCloneError", "ConstraintError", "ReadOnlyError", "VersionError"].includes(error.name));
+
+/**
+ * A transaction whose requests `fn` makes at once (none from another's callback): committed straight after, waited
+ * for, and tried again (DB_RETRY_MS, on a fresh connection) if it fails. Never started while the page is in the
+ * back/forward cache. Resolves with what `fn` returned, its requests' results filled in.
+ * @template T
+ * @param {string[]} stores
+ * @param {IDBTransactionMode} mode
+ * @param {(tx: IDBTransaction) => T} fn
+ * @returns {Promise<T>}
+ */
+export async function run_tx(stores, mode, fn) {
+	for (let i = 0; ; i++) {
+		try {
+			while (page_away) {
+				await page_away;
+			}
+			const db = await open_db();
+			/** @type {IDBTransaction} */
+			let tx;
+			try {
+				tx = db.transaction(stores, mode);
+			} catch (error) {
+				// (closed under it: opened again)
+				drop_db(db);
+				throw error;
+			}
+			const out = fn(tx);
+			commit_tx(tx);
+			await done(tx);
+			return out;
+		} catch (error) {
+			if (i >= DB_RETRY_MS.length || !retryable(error)) {
+				throw error;
+			}
+			await sleep(DB_RETRY_MS[i]);
+		}
+	}
+}
+
+/**
+ * A transaction that makes requests from its requests' callbacks (it can't commit at once): `fn` calls finish() after
+ * its last request, which commits it. Aborted if the page goes into the back/forward cache meanwhile (PageAwayError).
+ * @template T
+ * @param {string[]} stores
+ * @param {IDBTransactionMode} mode
+ * @param {(tx: IDBTransaction, finish: () => void) => Promise<T> | T} fn
+ * @returns {Promise<T>}
+ */
+async function run_chained_tx(stores, mode, fn) {
+	while (page_away) {
+		await page_away;
+	}
+	const db = await open_db();
+	const tx = db.transaction(stores, mode);
+	open_tx.add(tx);
+	const finished = done(tx).finally(() => open_tx.delete(tx));
+	try {
+		const out = await fn(tx, () => commit_tx(tx));
+		commit_tx(tx);
+		await finished;
+		return out;
+	} catch (error) {
+		try {
+			tx.abort();
+		} catch (_error) { /* finished */ }
+		await finished.catch(() => { });
+		throw page_away ? new PageAwayError() : error;
+	}
 }
 
 /** @param {IDBRequest} request */
@@ -86,7 +266,7 @@ const req = (request) => new Promise((resolve, reject) => {
 const done = (tx) => new Promise((resolve, reject) => {
 	tx.oncomplete = () => resolve(undefined);
 	tx.onerror = () => reject(tx.error);
-	tx.onabort = () => reject(tx.error || new Error("transaction aborted"));
+	tx.onabort = () => reject(page_away ? new PageAwayError() : tx.error || new Error("transaction aborted"));
 });
 
 /** All parts of one draft */
@@ -98,12 +278,12 @@ const parts_range = (key) => IDBKeyRange.bound([key, ""], [key, "￿"]);
  * @returns {Promise<null | { meta: any, file: import("./paint95-format.js").P95File, snapshot: Uint8Array | null, bytes: number }>}
  */
 export async function load_draft(key) {
-	const db = await open_db();
-	const tx = db.transaction([DRAFTS, PARTS], "readonly");
-	const [meta, parts] = await Promise.all([
-		req(tx.objectStore(DRAFTS).get(key)),
-		req(tx.objectStore(PARTS).getAll(parts_range(key))),
-	]);
+	const got = await run_tx([DRAFTS, PARTS], "readonly", (tx) => ({
+		meta: tx.objectStore(DRAFTS).get(key),
+		parts: tx.objectStore(PARTS).getAll(parts_range(key)),
+	}));
+	const meta = got.meta.result;
+	const parts = got.parts.result;
 	if (!meta) {
 		return null;
 	}
@@ -163,11 +343,10 @@ function to_bytes(data) {
  * @param {string} key
  */
 export async function delete_draft(key) {
-	const db = await open_db();
-	const tx = db.transaction([DRAFTS, PARTS], "readwrite");
-	tx.objectStore(DRAFTS).delete(key);
-	tx.objectStore(PARTS).delete(parts_range(key));
-	await done(tx);
+	await run_tx([DRAFTS, PARTS], "readwrite", (tx) => {
+		tx.objectStore(DRAFTS).delete(key);
+		tx.objectStore(PARTS).delete(parts_range(key));
+	});
 }
 
 /**
@@ -176,56 +355,54 @@ export async function delete_draft(key) {
  * @param {string} key
  */
 export async function set_draft_aside(key) {
-	const db = await open_db();
-	const tx = db.transaction([DRAFTS, PARTS], "readwrite");
-	const drafts = tx.objectStore(DRAFTS);
-	const parts = tx.objectStore(PARTS);
 	const aside = `${key}~unreadable-${Date.now()}`;
-	const meta = await req(drafts.get(key));
-	if (meta) {
-		const list = await req(parts.getAll(parts_range(key)));
-		for (const part of list) {
+	// (read, then written in a second transaction: each one commits at once; one editor per draft, so nothing writes
+	// it in between)
+	const got = await run_tx([DRAFTS, PARTS], "readonly", (tx) => ({
+		meta: tx.objectStore(DRAFTS).get(key),
+		parts: tx.objectStore(PARTS).getAll(parts_range(key)),
+	}));
+	const meta = got.meta.result;
+	if (!meta) {
+		return aside;
+	}
+	await run_tx([DRAFTS, PARTS], "readwrite", (tx) => {
+		const drafts = tx.objectStore(DRAFTS);
+		const parts = tx.objectStore(PARTS);
+		for (const part of got.parts.result) {
 			parts.put({ ...part, key: aside });
 		}
 		drafts.put({ ...meta, key: aside, set_aside: true, aside_at: Date.now() });
 		drafts.delete(key);
 		parts.delete(parts_range(key));
-	}
-	await done(tx);
+	});
 	return aside;
 }
 
 /**
- * Deletes drafts not saved (or set aside) for DRAFT_MAX_AGE_MS (all drafts in this database are this tool's).
+ * Deletes drafts not saved (or set aside) for DRAFT_MAX_AGE_MS (all drafts in this database are this tool's), but
+ * never `keep` (the draft this page has open: its pieces are still in use).
+ * @param {number} [now]
+ * @param {string} [keep]
  * @returns {Promise<number>} how many were deleted
  */
-export async function expire_drafts(now = Date.now()) {
-	const db = await open_db();
-	const tx = db.transaction([DRAFTS, PARTS], "readwrite");
-	const drafts = tx.objectStore(DRAFTS);
-	const parts = tx.objectStore(PARTS);
-	let count = 0;
-	await new Promise((resolve, reject) => {
-		const cursor_request = drafts.openCursor();
-		cursor_request.onerror = () => reject(cursor_request.error);
-		cursor_request.onsuccess = () => {
-			const cursor = cursor_request.result;
-			if (!cursor) {
-				resolve(undefined);
-				return;
-			}
-			const meta = cursor.value;
-			const at = Math.max(typeof meta.saved === "number" ? meta.saved : 0, typeof meta.aside_at === "number" ? meta.aside_at : 0);
-			if (!(at > 0 && now - at < DRAFT_MAX_AGE_MS)) {
-				parts.delete(parts_range(meta.key));
-				cursor.delete();
-				count++;
-			}
-			cursor.continue();
-		};
+export async function expire_drafts(now = Date.now(), keep = "") {
+	// (the records read in one transaction and the old ones deleted in another, not with a cursor: a cursor makes its
+	// requests from callbacks, so its transaction couldn't commit at once)
+	const all = await run_tx([DRAFTS], "readonly", (tx) => tx.objectStore(DRAFTS).getAll());
+	const old = all.result.filter((/** @type {any} */ meta) => {
+		const at = Math.max(typeof meta.saved === "number" ? meta.saved : 0, typeof meta.aside_at === "number" ? meta.aside_at : 0);
+		return meta.key !== keep && !(at > 0 && now - at < DRAFT_MAX_AGE_MS);
 	});
-	await done(tx);
-	return count;
+	if (old.length) {
+		await run_tx([DRAFTS, PARTS], "readwrite", (tx) => {
+			for (const meta of old) {
+				tx.objectStore(PARTS).delete(parts_range(meta.key));
+				tx.objectStore(DRAFTS).delete(meta.key);
+			}
+		});
+	}
+	return old.length;
 }
 
 // #endregion
@@ -327,8 +504,10 @@ export class Autosaver {
 		this.saved_events = recorder.segment.events.length;
 		this.saved_blobs = recorder.blobs.length;
 		this.dirty = false;
-		this.last_change = 0;
 		this.timer = 0;
+		/** a save is due, waiting for the pen to lift */
+		this.due = false;
+		this.due_check = false;
 		/** @type {Promise<void> | null} */
 		this.saving = null;
 		this.again = false;
@@ -341,15 +520,31 @@ export class Autosaver {
 		this.last_stats = null;
 
 		recorder.onchange = () => this.changed();
-		// Hidden (a swipe back, the app switcher, another tab) may be the last chance: on iOS the page is often never
-		// shown again. Save now, up to the stroke under way.
+		// When to save: the copy has to be current before the page is left, not when it is. A save is due
+		// SAVE_DELAY_MS after the first change since the last one, and later changes don't put it off, so drawing
+		// without a pause still saves (it waits for the pen to lift: on_timer). Leaving is a bonus: a page hidden
+		// (the app switcher, another tab; iOS delivers it before it suspends the page) saves at once, up to the stroke
+		// under way; but a page going into the back/forward cache (a swipe back in Safari or the iOS app: pagehide,
+		// persisted, and the visibilitychange after it) starts nothing, since WebKit freezes it right away and the
+		// write would never run (it would only hold the store, see "IndexedDB"). What it held is saved when it is
+		// shown again.
 		const on_hidden = () => {
-			if (document.visibilityState === "hidden") {
+			if (document.visibilityState === "hidden" && !is_page_away()) {
 				this.save_now();
 			}
 		};
 		document.addEventListener("visibilitychange", on_hidden);
-		addEventListener("pagehide", () => this.save_now());
+		addEventListener("pagehide", (event) => {
+			if (!(/** @type {PageTransitionEvent} */ (event).persisted)) {
+				this.save_now();
+			}
+		});
+		on_page_back.add(() => {
+			if (this.dirty && !this.deleted && !this.disabled) {
+				clearTimeout(this.timer);
+				this.timer = setTimeout(() => this.on_timer(), 0);
+			}
+		});
 	}
 
 	/**
@@ -388,8 +583,20 @@ export class Autosaver {
 			return;
 		}
 		this.dirty = true;
-		this.last_change = performance.now();
-		if (!this.timer) {
+		if (this.due) {
+			// a save is due, waiting for the pen to lift: this change may be its lifting (checked once it is recorded)
+			if (!this.due_check) {
+				this.due_check = true;
+				setTimeout(() => {
+					this.due_check = false;
+					if (this.due && !this.busy()) {
+						clearTimeout(this.timer);
+						this.on_timer();
+					}
+				}, 0);
+			}
+		} else if (!this.timer) {
+			// (a save already due stands: later changes never put it off)
 			this.timer = setTimeout(() => this.on_timer(), SAVE_DELAY_MS);
 		}
 		this.report();
@@ -397,28 +604,21 @@ export class Autosaver {
 
 	on_timer() {
 		this.timer = 0;
-		const since = performance.now() - this.last_change;
-		if (since < SAVE_DELAY_MS - 20) {
-			// still changing: wait until it settles
-			this.timer = setTimeout(() => this.on_timer(), SAVE_DELAY_MS - since);
+		if (!this.dirty || this.deleted || this.disabled || is_page_away()) {
+			// (in the back/forward cache: saved when shown again)
+			this.due = false;
 			return;
 		}
 		if (this.busy()) {
-			this.timer = setTimeout(() => this.on_timer(), 400);
+			// mid-stroke (or replaying): saved as soon as the pen lifts (changed), or found here a moment later
+			this.due = true;
+			this.timer = setTimeout(() => this.on_timer(), 250);
 			return;
 		}
-		const run = () => {
-			if (this.busy()) {
-				this.timer = setTimeout(() => this.on_timer(), 400);
-				return;
-			}
-			this.save();
-		};
-		if (typeof requestIdleCallback === "function") {
-			requestIdleCallback(run, { timeout: 1000 });
-		} else {
-			setTimeout(run, 0);
-		}
+		this.due = false;
+		// (right away, not at an idle moment: the next stroke may start any moment, and the page may be left; a save
+		// takes a few ms on the main thread)
+		this.save();
 	}
 
 	/** Mid-stroke (or replaying): don't save now */
@@ -481,13 +681,19 @@ export class Autosaver {
 			return this.saving;
 		}
 		this.dirty = false;
+		this.due = false;
 		this.saving = this.write().then(() => {
 			this.failed = false;
 		}, (error) => {
-			// (QuotaExceededError: the device is full; anything else: IndexedDB broke.) Nothing it wrote counts (write
-			// keeps its pieces only once the transaction is done), so the next try writes it all again.
-			console.warn("[autosave] couldn't save the drawing on this device", error);
 			this.dirty = true;
+			if (error instanceof PageAwayError) {
+				// (the page went into the back/forward cache: not a failure; saved again when it is shown)
+				return;
+			}
+			// (QuotaExceededError: the device is full; anything else: IndexedDB broke, and stayed broken through
+			// DB_RETRY_MS.) Nothing it wrote counts (write keeps its pieces only once the transaction is done), so the next
+			// try writes it all again.
+			console.warn("[autosave] couldn't save the drawing on this device", error);
 			const first = !this.failed;
 			this.failed = true;
 			if (first) {
@@ -596,17 +802,20 @@ export class Autosaver {
 			open_stroke: closing.length > 0,
 		};
 
-		const db = await open_db();
 		if (this.deleted) {
 			return;
 		}
-		const tx = db.transaction([DRAFTS, PARTS], "readwrite");
-		const parts = tx.objectStore(PARTS);
-		for (const { name, data } of puts) {
-			parts.put({ key: this.key, name, data });
+		await run_tx([DRAFTS, PARTS], "readwrite", (tx) => {
+			const parts = tx.objectStore(PARTS);
+			for (const { name, data } of puts) {
+				parts.put({ key: this.key, name, data });
+			}
+			tx.objectStore(DRAFTS).put(meta);
+		});
+		if (this.deleted) {
+			// (deleted while it was writing: a submit, or Discard) the copy goes after all
+			return;
 		}
-		tx.objectStore(DRAFTS).put(meta);
-		await done(tx);
 		this.previous_stored = previous_stored;
 		this.blob_names = blob_names;
 		this.chunk_names = chunk_names;
@@ -644,24 +853,29 @@ export class Autosaver {
 			if (!png || this.deleted) {
 				return;
 			}
-			const db = await open_db();
-			const tx = db.transaction([DRAFTS, PARTS], "readwrite");
-			const drafts = tx.objectStore(DRAFTS);
-			const meta = await req(drafts.get(this.key));
-			// (deleted after a submit, or another tab saved since: leave it)
-			if (!meta || meta.session !== this.session) {
+			// (its get and puts chained: committed after the puts, aborted if the page goes away first)
+			const snapshot = await run_chained_tx([DRAFTS, PARTS], "readwrite", async (tx, finish) => {
+				const drafts = tx.objectStore(DRAFTS);
+				const meta = await req(drafts.get(this.key));
+				// (deleted after a submit, or another tab saved since: leave it)
+				if (!meta || meta.session !== this.session) {
+					return null;
+				}
+				const parts = tx.objectStore(PARTS);
+				parts.put({ key: this.key, name: this.snapshot_name, data: png });
+				const old = meta.snapshot?.name;
+				if (old && old !== this.snapshot_name) {
+					parts.delete([this.key, old]);
+				}
+				const made = { name: this.snapshot_name, hash, at: Date.now() };
+				meta.snapshot = made;
+				drafts.put(meta);
+				finish();
+				return made;
+			});
+			if (!snapshot) {
 				return;
 			}
-			const parts = tx.objectStore(PARTS);
-			parts.put({ key: this.key, name: this.snapshot_name, data: png });
-			const old = meta.snapshot?.name;
-			if (old && old !== this.snapshot_name) {
-				parts.delete([this.key, old]);
-			}
-			const snapshot = { name: this.snapshot_name, hash, at: Date.now() };
-			meta.snapshot = snapshot;
-			drafts.put(meta);
-			await done(tx);
 			this.snapshot = snapshot;
 			this.last_snapshot_stats = { bytes: png.byteLength, ms: Math.round(performance.now() - start) };
 		}).catch((error) => {

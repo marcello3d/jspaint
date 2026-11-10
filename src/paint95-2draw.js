@@ -425,22 +425,26 @@ function init_editor() {
 	}
 
 	/**
-	 * The copy of this drawing saved on this device, if any (expiring old copies first).
+	 * The copy of this drawing saved on this device, if any. Old copies (of other drawings) are dropped after it is read,
+	 * not before: the read comes first.
 	 * @returns {Promise<Awaited<ReturnType<typeof load_draft>>>}
 	 */
 	async function find_device_copy() {
-		try {
-			const expired = await expire_drafts();
-			if (expired) {
-				console.log(`[autosave] deleted ${expired} device ${expired === 1 ? "copy" : "copies"} older than 30 days`);
-			}
-		} catch (error) {
-			console.warn("[autosave] couldn't expire old device copies", error);
-		}
+		const expire = () => {
+			expire_drafts(Date.now(), draft_key).then((expired) => {
+				if (expired) {
+					console.log(`[autosave] deleted ${expired} device ${expired === 1 ? "copy" : "copies"} older than 30 days`);
+				}
+			}, (error) => {
+				console.warn("[autosave] couldn't expire old device copies", error);
+			});
+		};
 		let draft = null;
 		try {
 			draft = await load_draft(draft_key);
+			expire();
 		} catch (error) {
+			expire();
 			console.error("[autosave] the device copy can't be read; setting it aside", error);
 			await set_draft_aside(draft_key).catch(() => { });
 			return null;
