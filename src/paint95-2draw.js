@@ -96,6 +96,29 @@ function init_editor() {
 		return null;
 	}
 
+	/**
+	 * A small picture of the canvas (256 px on the long side): WebP, or JPEG where the browser can't make WebP.
+	 * @param {HTMLCanvasElement} canvas
+	 * @returns {Promise<Blob | null>}
+	 */
+	function thumbnail(canvas) {
+		const scale = Math.min(1, 256 / Math.max(canvas.width, canvas.height, 1));
+		const c = document.createElement("canvas");
+		c.width = Math.max(1, Math.round(canvas.width * scale));
+		c.height = Math.max(1, Math.round(canvas.height * scale));
+		const g = c.getContext("2d");
+		if (!g) {
+			return Promise.resolve(null);
+		}
+		g.fillStyle = "#fff";
+		g.fillRect(0, 0, c.width, c.height);
+		g.imageSmoothingQuality = "high";
+		g.drawImage(canvas, 0, 0, c.width, c.height);
+		/** @type {(type: string, quality: number) => Promise<Blob | null>} */
+		const as = (type, quality) => new Promise((resolve) => c.toBlob(resolve, type, quality));
+		return as("image/webp", 0.8).then((blob) => (blob && blob.type === "image/webp" ? blob : as("image/jpeg", 0.85)));
+	}
+
 	// The parent's leave question (see the contract above): asked only while leaving would lose something.
 	/** @type {string} */
 	let shown_leave = "";
@@ -455,6 +478,21 @@ function init_editor() {
 				console.error("[autosave] couldn't take the edit lock", error);
 			}
 		}
+		if (draft_key && !yielded) {
+			// With cloud drafts on, a copy on 2draw that this device lacks (drawn on another device) is put here first
+			// (2draw.net worker/src/client/draw-bar.ts drawCloudReady), so it is read as this device's own.
+			try {
+				const page = parent_page();
+				if (page && typeof page.drawCloudReady === "function") {
+					const from = await page.drawCloudReady();
+					if (from === "cloud") {
+						console.log("[autosave] brought this drawing's copy from 2draw");
+					}
+				}
+			} catch (error) {
+				console.warn("[autosave] couldn't check the copy on 2draw", error);
+			}
+		}
 		const draft = draft_key && !yielded ? await find_device_copy() : null;
 		const previous_promise = !draft && window.paint95_anim_url ? load_previous_animation(window.paint95_anim_url) : Promise.resolve(null);
 		let loaded = false;
@@ -557,6 +595,8 @@ function init_editor() {
 				const page = parent_page();
 				if (page) {
 					page.drawFlush = () => (autosaver ? autosaver.flush() : Promise.resolve());
+					// the picture for the lists of unsaved drawings, made when the page asks (draw-bar.ts cloudThumb)
+					page.drawThumb = () => thumbnail(main_canvas);
 				}
 				sync_leave();
 			} catch (error) {

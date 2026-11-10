@@ -320,6 +320,9 @@ export class Autosaver {
 		/** sealed chunks of the current segment */
 		this.chunk_names = [];
 		this.sealed = 0;
+		/** every piece's name, in the order written (the copy on 2draw takes them in this order: 2draw.net
+		 * worker/src/lib/draftlayouts.ts "p95-1") */
+		this.order = restored_meta ? restored_order(restored_meta) : [];
 		/** what the last save held */
 		this.saved_events = recorder.segment.events.length;
 		this.saved_blobs = recorder.blobs.length;
@@ -526,6 +529,7 @@ export class Autosaver {
 		const blob_names = this.blob_names.slice();
 		const chunk_names = this.chunk_names.slice();
 		let sealed = this.sealed;
+		const order = this.order.slice();
 
 		// previous sessions (a revision's posted recording): written once
 		recorder.previous_segments.forEach((segment, i) => {
@@ -587,6 +591,7 @@ export class Autosaver {
 			segments: [...previous_stored, { info, chunks: chunk_names, tail }],
 			blobs: blob_names,
 			snapshot: this.snapshot,
+			order: order.concat(puts.map((p) => p.name).filter((name) => !order.includes(name))),
 			events: recorder.previous_segments.reduce((n, s) => n + s.events.length, 0) + count + closing.length,
 			open_stroke: closing.length > 0,
 		};
@@ -606,6 +611,7 @@ export class Autosaver {
 		this.blob_names = blob_names;
 		this.chunk_names = chunk_names;
 		this.sealed = sealed;
+		this.order = meta.order;
 		this.ever_saved = true;
 		this.saved_events = count;
 		this.saved_blobs = recorder.blobs.length;
@@ -677,6 +683,29 @@ export class Autosaver {
 		}
 		return this.deleting;
 	}
+}
+
+/**
+ * The pieces of a restored copy in the order they were written: its own list, or (a copy saved before it kept one)
+ * the revision's segments, its blobs, then the session's chunks.
+ * @param {any} meta
+ * @returns {string[]}
+ */
+function restored_order(meta) {
+	if (Array.isArray(meta.order)) {
+		return meta.order.slice();
+	}
+	const out = [];
+	const segments = Array.isArray(meta.segments) ? meta.segments : [];
+	for (const segment of segments.slice(0, -1)) {
+		out.push(...(segment.chunks || []));
+	}
+	out.push(...(meta.blobs || []));
+	const last = segments[segments.length - 1];
+	if (last) {
+		out.push(...(last.chunks || []));
+	}
+	return [...new Set(out)];
 }
 
 /**
