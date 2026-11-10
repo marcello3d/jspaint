@@ -163,7 +163,7 @@ function init_editor() {
 		title.textContent = "This drawing is open in another tab.";
 		const words = document.createElement("p");
 		words.style.cssText = "margin:0 0 12px;";
-		words.textContent = "Your drawing is saved on this device.";
+		words.textContent = "Drawing saved on this device.";
 		const button = document.createElement("button");
 		button.type = "button";
 		button.textContent = "Continue here";
@@ -516,8 +516,8 @@ function init_editor() {
 					height: required_height,
 					expected_hash: draft.meta.hash,
 					fallback_picture: draft.snapshot ? () => decode_png(draft.snapshot) : null,
-					title: "Restoring your drawing",
-					message: "Restoring your drawing from this device…",
+					title: "Restoring drawing",
+					message: "Restoring drawing from this device…",
 				});
 				previous = draft.file;
 				history_keep = result.keep;
