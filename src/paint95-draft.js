@@ -258,6 +258,7 @@ export async function run_tx(stores, mode, fn) {
 			const out = fn(tx);
 			commit_tx(tx);
 			await done(tx);
+			await requests_finished(out);
 			return out;
 		} catch (error) {
 			if (i >= DB_RETRY_MS.length || !retryable(error)) {
@@ -297,6 +298,21 @@ async function run_chained_tx(stores, mode, fn) {
 		await finished.catch(() => { });
 		throw page_away ? new PageAwayError() : error;
 	}
+}
+
+/**
+ * Waits for the read requests run_tx's `fn` returned (one, or an object of them) to have their result. A transaction
+ * committed at once can complete before a request's success: Chromium (seen in 147) unwraps a value over 64 KB (an
+ * incompressible part: a starting picture, the snapshot PNG) after the transaction's complete event, and reading
+ * .result before that throws InvalidStateError.
+ * @param {any} out
+ */
+function requests_finished(out) {
+	const requests = out instanceof IDBRequest ? [out] : out && typeof out === "object" ? Object.values(out).filter((v) => v instanceof IDBRequest) : [];
+	return Promise.all(requests.map((request) => request.readyState === "done" ? null : new Promise((resolve, reject) => {
+		request.addEventListener("success", resolve);
+		request.addEventListener("error", () => reject(request.error));
+	})));
 }
 
 /** @param {IDBRequest} request */
@@ -347,17 +363,28 @@ export async function load_draft(key) {
 		}
 		return data;
 	};
-	const segments = meta.segments.map((/** @type {any} */ stored) => {
+	// (a long drawing has dozens of chunks: decoded with a yield now and then, so reopening it doesn't hold the page)
+	let slice_start = performance.now();
+	const segments = [];
+	for (const stored of meta.segments) {
 		const events = [];
 		for (const name of stored.chunks) {
-			events.push(...unpack_events(get(name)));
+			if (performance.now() - slice_start > 8) {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				slice_start = performance.now();
+			}
+			for (const event of unpack_events(get(name))) {
+				events.push(event);
+			}
 		}
 		if (stored.tail) {
-			events.push(...unpack_events(to_bytes(stored.tail)));
+			for (const event of unpack_events(to_bytes(stored.tail))) {
+				events.push(event);
+			}
 			bytes += stored.tail.byteLength;
 		}
-		return { ...stored.info, events };
-	});
+		segments.push({ ...stored.info, events });
+	}
 	const blobs = meta.blobs.map(get);
 	const last = segments[segments.length - 1];
 	const file = {

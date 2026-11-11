@@ -127,7 +127,11 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 	// tool switch, making every option change slower and slower)
 	/** @type {(() => void)[]} */
 	let unbind_previous = [];
-	$chooser.on("update", () => {
+	const render = () => {
+		// 2draw: put off while replaying (P95.defer_ui)
+		if (window.P95.defer_ui(render)) {
+			return;
+		}
 		if (!$chooser.is(":visible")) {
 			return;
 		}
@@ -171,6 +175,10 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 					return option_div;
 				};
 				const update = () => {
+					// 2draw: put off while replaying (P95.defer_ui)
+					if (window.P95.defer_ui(update)) {
+						return;
+					}
 					const selected_color = getComputedStyle($chooser[0]).getPropertyValue("--Hilight");
 					const unselected_color = gray_background_for_unselected ? "rgb(192, 192, 192)" : "";
 					$option_container.css({
@@ -217,7 +225,8 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 		};
 		$G.on("pointerup pointercancel", on_pointer_release);
 		unbind_previous.push(() => $G.off("pointerup pointercancel", on_pointer_release));
-	});
+	};
+	$chooser.on("update", () => render());
 	return $chooser;
 };
 /**

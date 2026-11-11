@@ -139,6 +139,81 @@ const TOOL_ROUNDED_RECTANGLE = "TOOL_ROUNDED_RECTANGLE";
 // the picture every time: the player renders in-progress strokes every frame. Same pixels as make_canvas(mask).
 /** @type {PixelCanvas | null} */
 let mask_fill_scratch = null;
+// 2draw: a tool's mask canvas (the size of the picture) is kept between strokes and cleared where it has content,
+// instead of being allocated for every stroke and freed after it (`width = 1`): that allocation (on a GPU canvas a new
+// texture) was most of the cost of a short stroke, and replaying a drawing makes thousands of strokes.
+// Same pixels: a cleared mask is all transparent, like a new one, and its context state is set back to a new canvas's.
+/** Masks bigger than this (pixels) are still freed after each stroke (memory) */
+const MASK_KEEP_MAX_PIXELS = 2000 * 1500;
+const CONTEXT_DEFAULT_KEYS = [
+	"fillStyle", "strokeStyle", "lineWidth", "lineCap", "lineJoin", "miterLimit", "lineDashOffset", "globalAlpha",
+	"globalCompositeOperation", "imageSmoothingEnabled", "imageSmoothingQuality", "font", "textAlign", "textBaseline",
+	"direction", "filter", "shadowBlur", "shadowColor", "shadowOffsetX", "shadowOffsetY",
+	"letterSpacing", "wordSpacing", "fontKerning", "fontStretch", "fontVariantCaps", "textRendering",
+];
+/** @type {Record<string, any> | null} a new 2D context's state */
+let context_defaults = null;
+/** @param {CanvasRenderingContext2D} ctx */
+function reset_context_state(ctx) {
+	if (!context_defaults) {
+		const fresh = /** @type {any} */ (document.createElement("canvas").getContext("2d"));
+		context_defaults = {};
+		for (const key of CONTEXT_DEFAULT_KEYS) {
+			if (key in fresh) context_defaults[key] = fresh[key];
+		}
+	}
+	const c = /** @type {any} */ (ctx);
+	for (const key in context_defaults) {
+		if (c[key] !== context_defaults[key]) c[key] = context_defaults[key];
+	}
+	ctx.setTransform(1, 0, 0, 1, 0, 0);
+	ctx.setLineDash([]);
+	ctx.beginPath();
+}
+/**
+ * A tool's mask sized to the picture: `mask` itself (resized if needed), or a new one.
+ * @param {PixelCanvas | null} mask
+ * @returns {PixelCanvas}
+ */
+function fit_mask_canvas(mask) {
+	if (!mask) {
+		return make_canvas(main_canvas.width, main_canvas.height);
+	}
+	if (mask.width !== main_canvas.width) {
+		mask.width = main_canvas.width;
+	}
+	if (mask.height !== main_canvas.height) {
+		mask.height = main_canvas.height;
+	}
+	return mask;
+}
+/**
+ * Clears a canvas where it may have content (the same pixels as clearing all of it).
+ * @param {PixelCanvas} canvas
+ */
+function clear_canvas_content(canvas) {
+	const b = canvas.content_bounds;
+	if (b === undefined) {
+		canvas.ctx.clearRect(0, 0, canvas.width, canvas.height);
+	} else if (b) {
+		canvas.ctx.clearRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+		canvas.set_content_bounds?.(null);
+	}
+}
+/**
+ * Empties a tool's mask after a stroke, as if it were new (or frees it, when it's big).
+ * @param {PixelCanvas} mask
+ */
+function clear_mask_canvas(mask) {
+	if (mask.width * mask.height > MASK_KEEP_MAX_PIXELS) {
+		mask.width = 1;
+		mask.height = 1;
+		return;
+	}
+	reset_context_state(mask.ctx);
+	clear_canvas_content(mask);
+}
+
 /**
  * The rectangle of a tool's mask to render: where it has content, or all of it.
  * @param {PixelCanvas} mask
@@ -476,7 +551,21 @@ const tools = [{
 		}
 	},
 	pointerdown() {
-		this.mask_canvas = make_canvas(main_canvas.width, main_canvas.height);
+		// 2draw: the mask is kept between strokes (fit_mask_canvas); mask_canvas is set only during a stroke
+		// (cleared first, in case a stroke ended some other way: a new mask every time, as before)
+		if (this.kept_mask_canvas) {
+			clear_mask_canvas(this.kept_mask_canvas);
+		}
+		this.kept_mask_canvas = fit_mask_canvas(this.kept_mask_canvas);
+		this.mask_canvas = this.kept_mask_canvas;
+	},
+	/** @type {PixelCanvas | null} */
+	kept_mask_canvas: null,
+	release_mask_canvas() {
+		if (this.mask_canvas) {
+			clear_mask_canvas(this.mask_canvas);
+		}
+		this.mask_canvas = null;
 	},
 	render_from_mask(ctx, previewing) {
 		ctx.save();
@@ -507,7 +596,9 @@ const tools = [{
 				gradient.addColorStop(6 / n, "gold");
 				color = gradient;
 			}
-			const mask_fill_canvas = make_canvas(this.mask_canvas);
+			// 2draw: the reused scratch canvas instead of a new one, the whole mask as before (the same pixels, and the same
+			// changed rectangle: a history step's patch, and so the history's memory, depend on it)
+			const mask_fill_canvas = mask_fill_canvas_from(this.mask_canvas, { x0: 0, y0: 0, x1: this.mask_canvas.width, y1: this.mask_canvas.height });
 			replace_colors_with_swatch(mask_fill_canvas.ctx, color, 0, 0);
 			ctx.drawImage(mask_fill_canvas, 0, 0);
 		}
@@ -522,11 +613,11 @@ const tools = [{
 		}, () => {
 			this.render_from_mask(main_ctx);
 
-			this.mask_canvas = null;
+			this.release_mask_canvas();
 		});
 	},
 	cancel() {
-		this.mask_canvas = null;
+		this.release_mask_canvas();
 	},
 	paint(ctx, _x, _y) {
 		bresenham_line(pointer_previous.x, pointer_previous.y, pointer.x, pointer.y, (x, y) => {
@@ -1389,11 +1480,18 @@ tools.forEach((tool) => {
 	}
 	if (tool.shape) {
 		tool.shape_canvas = null;
+		/** @type {PixelCanvas | null} 2draw: kept between gestures (fit_mask_canvas); shape_canvas is set only during one */
+		tool.kept_shape_canvas = null;
 		tool.pointerdown = () => {
-			tool.shape_canvas = make_canvas(main_canvas.width, main_canvas.height);
+			if (tool.kept_shape_canvas) {
+				clear_mask_canvas(tool.kept_shape_canvas);
+			}
+			tool.kept_shape_canvas = fit_mask_canvas(tool.kept_shape_canvas);
+			tool.shape_canvas = tool.kept_shape_canvas;
 		};
 		tool.paint = () => {
-			tool.shape_canvas.ctx.clearRect(0, 0, tool.shape_canvas.width, tool.shape_canvas.height);
+			// 2draw: clears where it has content (the same as clearing all of it)
+			clear_canvas_content(tool.shape_canvas);
 			tool.shape_canvas.ctx.fillStyle = main_ctx.fillStyle;
 			tool.shape_canvas.ctx.strokeStyle = main_ctx.strokeStyle;
 			tool.shape_canvas.ctx.lineWidth = main_ctx.lineWidth;
@@ -1429,15 +1527,8 @@ tools.forEach((tool) => {
 		tool.mask_canvas = null;
 
 		tool.pointerdown = (_ctx, _x, _y) => {
-			if (!tool.mask_canvas) {
-				tool.mask_canvas = make_canvas(main_canvas.width, main_canvas.height);
-			}
-			if (tool.mask_canvas.width !== main_canvas.width) {
-				tool.mask_canvas.width = main_canvas.width;
-			}
-			if (tool.mask_canvas.height !== main_canvas.height) {
-				tool.mask_canvas.height = main_canvas.height;
-			}
+			// 2draw: kept between strokes (fit_mask_canvas)
+			tool.mask_canvas = fit_mask_canvas(tool.mask_canvas);
 			tool.mask_canvas.ctx.disable_image_smoothing();
 		};
 		tool.pointerup = () => {
@@ -1450,8 +1541,7 @@ tools.forEach((tool) => {
 			}, () => {
 				tool.render_from_mask(main_ctx);
 
-				tool.mask_canvas.width = 1;
-				tool.mask_canvas.height = 1;
+				clear_mask_canvas(tool.mask_canvas);
 			});
 		};
 		tool.paint = (_ctx, x, y) => {
@@ -1459,8 +1549,7 @@ tools.forEach((tool) => {
 		};
 		tool.cancel = () => {
 			if (tool.mask_canvas) {
-				tool.mask_canvas.width = 1;
-				tool.mask_canvas.height = 1;
+				clear_mask_canvas(tool.mask_canvas);
 			}
 		};
 		tool.render_from_mask = (ctx, previewing) => { // could be private
@@ -1531,15 +1620,8 @@ tools.forEach((tool) => {
 		tool.mask_canvas = null;
 
 		tool.init_mask_canvas = (_ctx, _x, _y) => {
-			if (!tool.mask_canvas) {
-				tool.mask_canvas = make_canvas(main_canvas.width, main_canvas.height);
-			}
-			if (tool.mask_canvas.width !== main_canvas.width) {
-				tool.mask_canvas.width = main_canvas.width;
-			}
-			if (tool.mask_canvas.height !== main_canvas.height) {
-				tool.mask_canvas.height = main_canvas.height;
-			}
+			// 2draw: kept between strokes (fit_mask_canvas)
+			tool.mask_canvas = fit_mask_canvas(tool.mask_canvas);
 			tool.mask_canvas.ctx.disable_image_smoothing();
 		};
 		tool.pointerdown = (_ctx, _x, _y) => {
@@ -1552,8 +1634,7 @@ tools.forEach((tool) => {
 			}, () => {
 				tool.render_from_mask(main_ctx);
 
-				tool.mask_canvas.width = 1;
-				tool.mask_canvas.height = 1;
+				clear_mask_canvas(tool.mask_canvas);
 			});
 		};
 
@@ -1573,8 +1654,7 @@ tools.forEach((tool) => {
 
 		tool.cancel = () => {
 			if (tool.mask_canvas) {
-				tool.mask_canvas.width = 1;
-				tool.mask_canvas.height = 1;
+				clear_mask_canvas(tool.mask_canvas);
 			}
 		};
 		tool.render_from_mask = (ctx, previewing) => { // could be private

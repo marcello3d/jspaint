@@ -64,6 +64,8 @@ export class ReplayController {
 		this.version = 0;
 		/** replay work so far (ms, as measured while first replaying each part; checkpoints keep it) */
 		this.work = 0;
+		/** the event that took longest to process (ms), for the console and benchmarks */
+		this.longest_event = { ms: 0, entry: null };
 		/** @type {CheckpointStore | null} in-memory checkpoints for seeking (enable_checkpoints) */
 		this.checkpoints = null;
 	}
@@ -200,6 +202,9 @@ export class ReplayController {
 			}
 			let now = performance.now();
 			this.work += now - last;
+			if (now - last > this.longest_event.ms) {
+				this.longest_event = { ms: now - last, entry, tool: selected_tool?.id };
+			}
 			if (this.checkpoints) {
 				this.checkpoints.maybe_take(this);
 				now = performance.now();
