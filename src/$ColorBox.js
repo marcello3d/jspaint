@@ -68,11 +68,16 @@ function $ColorBox(vertical) {
 	const $background_color = $Swatch(selected_colors.background).addClass("color-selection background-color");
 	$current_colors.append($background_color, $foreground_color);
 
-	$G.on("option-changed", () => {
+	const update_current_colors = () => {
+		// 2draw: put off while replaying (P95.defer_ui)
+		if (window.P95.defer_ui(update_current_colors)) {
+			return;
+		}
 		update_$swatch($foreground_color, selected_colors.foreground);
 		update_$swatch($background_color, selected_colors.background);
 		update_$swatch($current_colors, selected_colors.ternary);
-	});
+	};
+	$G.on("option-changed", update_current_colors);
 
 	$current_colors.on("pointerdown", () => {
 		const new_bg = selected_colors.foreground;

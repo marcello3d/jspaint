@@ -132,15 +132,17 @@ export class Recorder {
 	 * @param {string | null} [options.url] - the starting picture's URL, if it's an immutable 2draw picture: stored by
 	 *   reference (with its hash) instead of embedding it
 	 * @param {boolean} [options.snapped] - after restoring the history, the canvas was set to the posted picture
+	 * @param {number | null} [options.hash] - for "continue": the canvas's hash (hash_image_data), if the caller has it
+	 *   (restoring a drawing just worked it out; a whole big canvas takes a while to hash)
 	 */
-	begin({ start, history_keep = null, url = null, snapped = false }) {
-		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+	begin({ start, history_keep = null, url = null, snapped = false, hash = null }) {
+		const image_data = start === "continue" && hash != null && !snapped ? null : main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 		if (start === "image" && url) {
 			this.segment.start = { type: "image", url, hash: hash_image_data(image_data) };
 		} else if (start === "image") {
 			this.segment.start = { type: "image", blob: this.add_blob(image_data) };
 		} else if (start === "continue") {
-			this.segment.start = { type: "continue", hash: hash_image_data(image_data) };
+			this.segment.start = { type: "continue", hash: image_data ? hash_image_data(image_data) : hash };
 			if (url) {
 				this.segment.start.url = url;
 			}

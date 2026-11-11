@@ -407,6 +407,9 @@ function draw_fill_without_pattern_support(ctx, start_x, start_y, fill_r, fill_g
 	const start_g = id.data[pixel_pos + 1];
 	const start_b = id.data[pixel_pos + 2];
 	const start_a = id.data[pixel_pos + 3];
+	const words = new Uint32Array(id.data.buffer, id.data.byteOffset, id.data.byteLength >> 2);
+	// (-1 matches nothing: a start just past the canvas edge fills nothing, as before)
+	const start_word = pixel_pos >= 0 && pixel_pos < id.data.length ? words[pixel_pos >> 2] : -1;
 
 	// @TODO: Allow flood-filling colors similar within fill threshold.
 	// Right now it will cause an infinite loop if we don't stop early in this case.
@@ -488,6 +491,10 @@ function draw_fill_without_pattern_support(ctx, start_x, start_y, fill_r, fill_g
 	}
 
 	function should_fill_at(pixel_pos) {
+		// 2draw: most pixels of the region are exactly the start color: one comparison (the same answer)
+		if (words[pixel_pos >> 2] === start_word) {
+			return true;
+		}
 		return (
 			// matches start color (i.e. region to fill)
 			Math.abs(id.data[pixel_pos + 0] - start_r) <= fill_threshold &&

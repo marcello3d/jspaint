@@ -62,6 +62,20 @@ html, body {
 	background: rgba(0, 0, 0, 0.15);
 	cursor: wait;
 }
+.paint95-restore-overlay-quiet {
+	background: transparent;
+}
 .paint95-restore-window {
 	z-index: 1001 !important;
+}
+/* the saved picture over the canvas while it is replayed (device copies) */
+.paint95-restore-preview-box {
+	position: fixed;
+	z-index: 999;
+	overflow: hidden;
+	pointer-events: none;
+}
+.paint95-restore-preview {
+	position: absolute;
+	image-rendering: pixelated;
 }

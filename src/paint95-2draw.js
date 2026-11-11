@@ -507,9 +507,25 @@ function init_editor() {
 		let history_keep = null;
 		let snapped = false;
 		let restored_meta = null;
+		/** @type {number | null} the canvas's hash after restoring, if known */
+		let restored_hash = null;
 		if (draft) {
 			// The copy saved on this device beats a blank start and the previous version: replay it, so its undo history
 			// is back, and keep recording from there.
+			// While it replays, the copy on this device is the drawing: leaving loses nothing (no leave warning), and the
+			// page can say it is saved.
+			try {
+				const page = parent_page();
+				if (page) {
+					page.drawPersists = true;
+					page.drawUnchanged = false;
+					page.drawGuard?.(false);
+					shown_leave = "true|false|false";
+				}
+			} catch (error) {
+				console.error("[autosave] couldn't tell the page", error);
+			}
+			announce_saved(draft.meta.saved);
 			try {
 				const result = await restore_history(draft.file, {
 					width: required_width,
@@ -518,15 +534,17 @@ function init_editor() {
 					fallback_picture: draft.snapshot ? () => decode_png(draft.snapshot) : null,
 					title: "Restoring drawing",
 					message: "Restoring drawing from this device…",
+					// the picture saved with the copy (only kept when it is the copy's last picture)
+					preview: draft.snapshot,
 				});
 				previous = draft.file;
 				history_keep = result.keep;
 				snapped = result.snapped;
 				restored_meta = draft.meta;
+				restored_hash = result.hash;
 				if (draft.meta.open_stroke && !result.snapped) {
 					// saved mid-stroke (no picture hash then): the replay's picture is where it ends
-					const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-					const end = { hash: hash_image_data(image_data), width: image_data.width, height: image_data.height };
+					const end = { hash: result.hash ?? hash_image_data(main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height)), width: main_canvas.width, height: main_canvas.height };
 					const segments = draft.file.header.segments;
 					segments[segments.length - 1].end = end;
 					const stored = restored_meta.segments[restored_meta.segments.length - 1];
@@ -554,6 +572,7 @@ function init_editor() {
 			const expected_image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 			try {
 				const result = await restore_history(previous, { width: required_width, height: required_height, expected_image_data });
+				restored_hash = result.hash;
 				history_keep = result.keep;
 				snapped = result.snapped;
 				set_magnification(1);
@@ -571,7 +590,7 @@ function init_editor() {
 			recorder = new Recorder({ previous });
 			// An immutable versioned 2draw picture (…/data/13/132726/132726-v1.png) is stored by reference.
 			const reference_url = loaded && is_reference_url(window.paint95_load_url) ? window.paint95_load_url : null;
-			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank", history_keep, url: reference_url, snapped });
+			recorder.begin({ start: previous ? "continue" : loaded ? "image" : "blank", history_keep, url: reference_url, snapped, hash: restored_hash });
 		} catch (error) {
 			console.error("Failed to start recording", error);
 			recorder = null;

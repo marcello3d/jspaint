@@ -44,6 +44,35 @@
 		/** "edit" | "replay" */
 		mode: new URLSearchParams(location.search).has("replay") ? "replay" : "edit",
 		get replaying() { return P95.mode === "replay"; },
+		/**
+		 * UI-only updates (the tool options, the color box) are put off while replaying: they don't change the picture,
+		 * and a replay switches tools and colors thousands of times. In the editor (restoring a drawing), the last call of
+		 * each runs once it's done (flush_ui); the player (?replay=1) shows none of that UI.
+		 * @param {() => void} fn
+		 * @returns {boolean} true if put off (don't run it now)
+		 */
+		defer_ui(fn) {
+			if (P95.mode !== "replay") return false;
+			if (!P95.player_page) {
+				P95.deferred_ui.delete(fn);
+				P95.deferred_ui.add(fn);
+			}
+			return true;
+		},
+		/** @type {Set<() => void>} */
+		deferred_ui: new Set(),
+		player_page: new URLSearchParams(location.search).has("replay"),
+		flush_ui() {
+			const fns = [...P95.deferred_ui];
+			P95.deferred_ui.clear();
+			for (const fn of fns) {
+				try {
+					fn();
+				} catch (error) {
+					console.error("[replay] UI update failed", error);
+				}
+			}
+		},
 		/** &p95debug=1: hash the canvas before every recorded event, to find where a replay diverges */
 		debug: new URLSearchParams(location.search).has("p95debug"),
 		/** set by the recorder while it is active */

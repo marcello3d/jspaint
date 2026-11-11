@@ -102,6 +102,10 @@ function $ToolBox(tools, is_extras) {
 	));
 	$c.appendTo(get_direction() === "rtl" ? $right : $left); // opposite ColorBox by default
 	$c.update_selected_tool = () => {
+		// 2draw: put off while replaying (P95.defer_ui)
+		if (window.P95.defer_ui($c.update_selected_tool)) {
+			return;
+		}
 		$buttons.removeClass("selected");
 		selected_tools.forEach((selected_tool) => {
 			selected_tool.$button.addClass("selected");
