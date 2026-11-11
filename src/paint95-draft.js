@@ -863,44 +863,65 @@ export class Autosaver {
 		let sealed = this.sealed;
 		const order = this.order.slice();
 
-		// previous sessions (a revision's posted recording): written once
-		recorder.previous_segments.forEach((segment, i) => {
-			if (!previous_stored[i]) {
-				const name = `${this.prefix}p${i}`;
-				puts.push({ name, data: pack_events(segment.events) });
-				previous_stored[i] = { info: segment_info(segment), chunks: [name], tail: null };
-			}
-		});
-		// blobs: written once, as PNG (kept as PNG in the recorder too, so finalize doesn't encode them again)
-		for (let i = 0; i < recorder.blobs.length; i++) {
-			if (!blob_names[i]) {
-				const blob = recorder.blobs[i];
-				const png = "png" in blob ? blob.png : encode_png(blob.image_data);
-				if (!("png" in blob)) {
-					recorder.blobs[i] = { png };
-				}
-				const name = `${this.prefix}b${i}`;
-				puts.push({ name, data: png });
-				blob_names[i] = name;
-			}
-		}
-		// this session's events: sealed chunks, plus the rest as the tail
+		// The picture and the events it is made of, as of now (one task: the slices below only read these copies).
 		const events = recorder.segment.events;
 		const count = events.length;
-		while (count - sealed >= CHUNK_EVENTS) {
-			const name = `${this.prefix}c${chunk_names.length}`;
-			puts.push({ name, data: pack_events(events.slice(sealed, sealed + CHUNK_EVENTS)) });
-			chunk_names.push(name);
-			sealed += CHUNK_EVENTS;
-		}
 		// A stroke under way (the page is being hidden): the copy ends it where the pointer is now, so a replay of the
 		// copy has the stroke as drawn so far. Its picture isn't known until that replay, so the copy has no hash.
 		const closing = open_stroke_ends(recorder, events);
-		const tail = pack_events(closing.length ? [...events.slice(sealed, count), ...closing] : events.slice(sealed, count));
 		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 		const info = segment_info(recorder.segment);
 		info.duration = Math.max(recorder.last_t, Math.round(recorder.now()));
+		const blob_count = recorder.blobs.length;
+		const previous = recorder.previous_segments.slice();
+		/** @type {(() => void)[]} the encoding, a slice each (or all at once when urgent) */
+		const jobs = [];
+		// previous sessions (a revision's posted recording): written once
+		previous.forEach((segment, i) => {
+			if (!previous_stored[i]) {
+				const name = `${this.prefix}p${i}`;
+				previous_stored[i] = { info: segment_info(segment), chunks: [name], tail: null };
+				jobs.push(() => puts.push({ name, data: pack_events(segment.events) }));
+			}
+		});
+		// blobs: written once, as PNG (kept as PNG in the recorder too, so finalize doesn't encode them again)
+		for (let i = 0; i < blob_count; i++) {
+			if (!blob_names[i]) {
+				const name = `${this.prefix}b${i}`;
+				blob_names[i] = name;
+				jobs.push(() => {
+					const blob = recorder.blobs[i];
+					const png = "png" in blob ? blob.png : encode_png(blob.image_data);
+					if (!("png" in blob)) {
+						recorder.blobs[i] = { png };
+					}
+					puts.push({ name, data: png });
+				});
+			}
+		}
+		// this session's events: sealed chunks, plus the rest as the tail
+		while (count - sealed >= CHUNK_EVENTS) {
+			const name = `${this.prefix}c${chunk_names.length}`;
+			const list = events.slice(sealed, sealed + CHUNK_EVENTS);
+			jobs.push(() => puts.push({ name, data: pack_events(list) }));
+			chunk_names.push(name);
+			sealed += CHUNK_EVENTS;
+		}
+		const rest = closing.length ? [...events.slice(sealed, count), ...closing] : events.slice(sealed, count);
+		/** @type {Uint8Array} */
+		let tail = new Uint8Array(0);
+		jobs.push(() => {
+			tail = pack_events(rest);
+		});
 		let sync_ms = performance.now() - start;
+		for (const job of jobs) {
+			if (!urgent()) {
+				await next_slice(false, since);
+			}
+			const t = performance.now();
+			job();
+			sync_ms = Math.max(sync_ms, performance.now() - t);
+		}
 		// (the picture as of now, hashed in slices with a yield between: a big canvas at once is a long task)
 		const sliced = closing.length ? null : await hash_image_data_sliced(image_data, urgent(), since);
 		const hash = sliced ? sliced.hash : null;
