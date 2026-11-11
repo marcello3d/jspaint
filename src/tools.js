@@ -155,6 +155,10 @@ const CONTEXT_DEFAULT_KEYS = [
 let context_defaults = null;
 /** @param {CanvasRenderingContext2D} ctx */
 function reset_context_state(ctx) {
+	// saved states left by a drawing call (a new canvas has none; restoring with none left does nothing)
+	for (let i = 0; i < 8; i++) {
+		ctx.restore();
+	}
 	if (!context_defaults) {
 		const fresh = /** @type {any} */ (document.createElement("canvas").getContext("2d"));
 		context_defaults = {};
@@ -166,7 +170,9 @@ function reset_context_state(ctx) {
 	for (const key in context_defaults) {
 		if (c[key] !== context_defaults[key]) c[key] = context_defaults[key];
 	}
-	ctx.setTransform(1, 0, 0, 1, 0, 0);
+	// (the prototype's, not the canvas's own wrapper from track_canvas_bounds: calling that marks the transform as used,
+	// and then every later drawing call on the mask asks for the transform, which is slow)
+	CanvasRenderingContext2D.prototype.setTransform.call(ctx, 1, 0, 0, 1, 0, 0);
 	ctx.setLineDash([]);
 	ctx.beginPath();
 }
@@ -211,6 +217,7 @@ function clear_mask_canvas(mask) {
 		return;
 	}
 	reset_context_state(mask.ctx);
+	mask.reset_transform_tracking?.();
 	clear_canvas_content(mask);
 }
 

@@ -330,6 +330,14 @@ function track_canvas_bounds(canvas, ctx) {
 			return original.apply(this, arguments);
 		};
 	}
+	/**
+	 * 2draw: the transform is the identity again (a reused tool mask, reset like a new canvas: paint95 tools.js
+	 * clear_mask_canvas, which also empties its saved states): drawing calls skip asking for it again, as on a new canvas.
+	 */
+	canvas.reset_transform_tracking = () => {
+		const m = ctx.getTransform();
+		transform_used = !(m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1 && m.e === 0 && m.f === 0);
+	};
 	const translation = () => {
 		if (!transform_used) return IDENTITY;
 		const m = ctx.getTransform();
