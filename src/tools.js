@@ -568,14 +568,9 @@ const tools = [{
 		this.mask_canvas = null;
 	},
 	render_from_mask(ctx, previewing) {
-		// 2draw: only the part of the mask that has content (same pixels, as with the brush tools)
-		const r = mask_render_rect(this.mask_canvas, false);
-		if (!r) {
-			return;
-		}
 		ctx.save();
 		ctx.globalCompositeOperation = "destination-out";
-		ctx.drawImage(this.mask_canvas, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+		ctx.drawImage(this.mask_canvas, 0, 0);
 		ctx.restore();
 
 		if (previewing || !transparency) {
@@ -601,9 +596,11 @@ const tools = [{
 				gradient.addColorStop(6 / n, "gold");
 				color = gradient;
 			}
-			const mask_fill_canvas = mask_fill_canvas_from(this.mask_canvas, r);
-			replace_colors_with_swatch(mask_fill_canvas.ctx, color, r.x0, r.y0);
-			ctx.drawImage(mask_fill_canvas, r.x0, r.y0);
+			// 2draw: the reused scratch canvas instead of a new one, the whole mask as before (the same pixels, and the same
+			// changed rectangle: a history step's patch, and so the history's memory, depend on it)
+			const mask_fill_canvas = mask_fill_canvas_from(this.mask_canvas, { x0: 0, y0: 0, x1: this.mask_canvas.width, y1: this.mask_canvas.height });
+			replace_colors_with_swatch(mask_fill_canvas.ctx, color, 0, 0);
+			ctx.drawImage(mask_fill_canvas, 0, 0);
 		}
 	},
 	pointerup() {
