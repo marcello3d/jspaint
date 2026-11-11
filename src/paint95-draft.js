@@ -585,6 +585,8 @@ export class Autosaver {
 		/** a save is due, waiting for the pen to lift */
 		this.due = false;
 		this.due_check = false;
+		/** a gated save is waiting for drawPen.idle */
+		this.gate_waiting = false;
 		/** @type {Promise<void> | null} */
 		this.saving = null;
 		this.again = false;
@@ -709,11 +711,13 @@ export class Autosaver {
 	 * drawing without one, at the next pen-up).
 	 */
 	gated_save() {
-		if (this.due) {
+		this.due = true;
+		if (this.gate_waiting) {
 			return;
 		}
-		this.due = true;
+		this.gate_waiting = true;
 		draw_pen()?.idle(() => {
+			this.gate_waiting = false;
 			if (!this.due) {
 				return;
 			}
