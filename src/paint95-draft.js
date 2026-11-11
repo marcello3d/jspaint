@@ -16,7 +16,7 @@
 // the events gives back the segment's events exactly.
 
 import { decode_events, encode_events } from "./paint95-events.js";
-import { FORMAT_VERSION, encode_png, hash_image_data } from "./paint95-format.js";
+import { FORMAT_VERSION, encode_png } from "./paint95-format.js";
 
 export const DB_NAME = "2draw-paint95-drafts";
 const DB_VERSION = 1;
@@ -437,6 +437,36 @@ function make_session_id() {
 }
 
 /** @param {HTMLCanvasElement} canvas */
+/** Words hashed per slice (hash_image_data_sliced). */
+const HASH_SLICE_WORDS = 1 << 17;
+
+/**
+ * hash_image_data in slices of HASH_SLICE_WORDS pixels with a yield between them (the same hash): a save happens
+ * every moment while drawing, and hashing a whole big canvas at once held the page for tens of ms on a slow phone.
+ * @param {ImageData} image_data - a copy (getImageData): it doesn't change meanwhile
+ * @returns {Promise<{ hash: number, longest: number }>} the hash, and the longest slice's main-thread time (ms)
+ */
+export async function hash_image_data_sliced(image_data) {
+	const { data, width, height } = image_data;
+	const words = new Uint32Array(data.buffer, data.byteOffset, data.byteLength >> 2);
+	let h = 0x811c9dc5;
+	h = Math.imul(h ^ width, 0x01000193);
+	h = Math.imul(h ^ height, 0x01000193);
+	let longest = 0;
+	for (let from = 0; from < words.length; from += HASH_SLICE_WORDS) {
+		const t = performance.now();
+		const to = Math.min(words.length, from + HASH_SLICE_WORDS);
+		for (let i = from; i < to; i++) {
+			h = Math.imul(h ^ words[i], 0x01000193);
+		}
+		longest = Math.max(longest, performance.now() - t);
+		if (to < words.length) {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+	}
+	return { hash: h >>> 0, longest };
+}
+
 function canvas_png(canvas) {
 	return new Promise((resolve) => {
 		try {
@@ -772,15 +802,20 @@ export class Autosaver {
 		const closing = open_stroke_ends(recorder, events);
 		const tail = pack_events(closing.length ? [...events.slice(sealed, count), ...closing] : events.slice(sealed, count));
 		const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-		const hash = closing.length ? null : hash_image_data(image_data);
 		const info = segment_info(recorder.segment);
 		info.duration = Math.max(recorder.last_t, Math.round(recorder.now()));
+		let sync_ms = performance.now() - start;
+		// (the picture as of now, hashed in slices with a yield between: a big canvas at once is a long task)
+		const sliced = closing.length ? null : await hash_image_data_sliced(image_data);
+		const hash = sliced ? sliced.hash : null;
+		if (sliced) {
+			sync_ms = Math.max(sync_ms, sliced.longest);
+		}
 		if (hash != null) {
 			info.end = { hash, width: image_data.width, height: image_data.height };
 		} else {
 			delete info.end;
 		}
-		const sync_ms = performance.now() - start;
 
 		const saved = Date.now();
 		const meta = {
