@@ -1249,8 +1249,51 @@ $canvas.on("pointerleave", (e) => {
 // #endregion
 
 // #region Panning and Zooming
-let last_zoom_pointer_distance;
-let pan_last_pos;
+// 2draw: pinch zoom is continuous (the original stepped 1.5x per 60px of finger travel, which felt choppy).
+// The canvas point under the fingers' midpoint at the start of the pinch stays under the midpoint,
+// and the zoom follows the ratio of finger distances. Applied at most once per frame.
+/** @type {{ start_distance: number, start_magnification: number, anchor: { x: number, y: number } } | null} */
+let pinch = null;
+let pinch_frame_queued = false;
+function client_to_canvas_float(client_x, client_y) {
+	const rect = main_canvas.getBoundingClientRect();
+	return {
+		x: (client_x - rect.left) / rect.width * main_canvas.width,
+		y: (client_y - rect.top) / rect.height * main_canvas.height,
+	};
+}
+function start_pinch() {
+	const mid = average_points(pointers);
+	pinch = {
+		start_distance: Math.max(1, Math.hypot(pointers[0].x - pointers[1].x, pointers[0].y - pointers[1].y)),
+		start_magnification: magnification,
+		anchor: client_to_canvas_float(mid.x, mid.y),
+	};
+}
+function apply_pinch_frame() {
+	pinch_frame_queued = false;
+	if (!pinch || pointers.length < 2) {
+		return;
+	}
+	const mid = average_points(pointers);
+	const distance = Math.hypot(pointers[0].x - pointers[1].x, pointers[0].y - pointers[1].y);
+	let new_magnification = pinch.start_magnification * distance / pinch.start_distance;
+	new_magnification = Math.max(0.5, Math.min(new_magnification, 40));
+	// Settle on whole zoom levels when close, where pixels look crisp
+	const nearest = Math.round(new_magnification);
+	if (nearest >= 1 && Math.abs(new_magnification - nearest) / nearest < 0.025) {
+		new_magnification = nearest;
+	}
+	if (new_magnification !== magnification) {
+		set_magnification(new_magnification, pinch.anchor);
+	}
+	// Pan so the anchor sits under the fingers' midpoint
+	const rect = main_canvas.getBoundingClientRect();
+	const anchor_x = rect.left + pinch.anchor.x / main_canvas.width * rect.width;
+	const anchor_y = rect.top + pinch.anchor.y / main_canvas.height * rect.height;
+	$canvas_area[0].scrollBy({ left: anchor_x - mid.x, top: anchor_y - mid.y, behavior: "instant" });
+	update_canvas_rect();
+}
 // let pan_start_magnification; // for panning and zooming in the same gesture (...was this ever used?)
 let first_pointer_time;
 const discard_quick_undo_period = 500; // milliseconds in which to treat gesture as just a pan/zoom if you use two fingers, rather than treating it as a brush stroke you might care about
@@ -1296,9 +1339,7 @@ $canvas_area.on("pointerdown", (event) => {
 		first_pointer_time = window.P95.now(); // 2draw: virtual clock for replay
 	}
 	if (pointers.length == 2) {
-		last_zoom_pointer_distance = Math.hypot(pointers[0].x - pointers[1].x, pointers[0].y - pointers[1].y);
-		pan_last_pos = average_points(pointers);
-		// pan_start_magnification = magnification;
+		start_pinch();
 	}
 	// Quick Undo when there are multiple pointers (i.e. for touch)
 	// See pointermove for other pointer types
@@ -1327,13 +1368,20 @@ $G.on("pointerup pointercancel", (event) => {
 	// (*Enabling Windows Ink means you can't select text in webpages, among other things.)
 	if (event.pointerId !== undefined && !pointers.some((pointer) => pointer.pointerId === event.pointerId) && pointers.length > 0) {
 		pointers = [];
+		pinch = null;
 		return;
 	}
 
 	// Normal pointer release handling
+	const count_before = pointers.length;
 	pointers = pointers.filter((pointer) =>
 		pointer.pointerId !== event.pointerId
 	);
+	if (pointers.length < 2) {
+		pinch = null;
+	} else if (pointers.length !== count_before) {
+		start_pinch(); // a third finger lifted: carry on with the remaining two from here
+	}
 });
 $G.on("pointermove", (event) => {
 	for (const pointer of pointers) {
@@ -1342,28 +1390,9 @@ $G.on("pointermove", (event) => {
 			pointer.y = event.clientY;
 		}
 	}
-	if (pointers.length >= 2) {
-		const current_pos = average_points(pointers);
-		const distance = Math.hypot(pointers[0].x - pointers[1].x, pointers[0].y - pointers[1].y);
-		const difference_in_distance = distance - last_zoom_pointer_distance;
-		let new_magnification = magnification;
-		if (Math.abs(difference_in_distance) > 60) {
-			last_zoom_pointer_distance = distance;
-			if (difference_in_distance > 0) {
-				new_magnification *= 1.5;
-			} else {
-				new_magnification /= 1.5;
-			}
-		}
-		new_magnification = Math.max(0.5, Math.min(new_magnification, 40));
-		if (new_magnification != magnification) {
-			set_magnification(new_magnification, to_canvas_coords({ clientX: current_pos.x, clientY: current_pos.y }));
-		}
-		const difference_in_x = current_pos.x - pan_last_pos.x;
-		const difference_in_y = current_pos.y - pan_last_pos.y;
-		$canvas_area.scrollLeft($canvas_area.scrollLeft() - difference_in_x);
-		$canvas_area.scrollTop($canvas_area.scrollTop() - difference_in_y);
-		pan_last_pos = current_pos;
+	if (pointers.length >= 2 && pinch && !pinch_frame_queued) {
+		pinch_frame_queued = true;
+		requestAnimationFrame(apply_pinch_frame);
 	}
 });
 // #endregion
