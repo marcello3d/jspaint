@@ -37,6 +37,49 @@ export const SNAPSHOT_INTERVAL_MS = 20000;
 export const RETRY_MS = 5000;
 const DRAFT_VERSION = 1;
 
+// #region The pen
+// Nothing interrupts drawing. On 2draw's draw page (the same-origin parent) window.drawPen (2draw.net
+// client/draw-bar.ts) says when the pen rests: a save waits for a pause in the drawing, not just for the pen to lift (a
+// save in the gap between two fast strokes held up the next one), and runs in slices of a few ms, each one only once
+// the pen rests again. Without that page (the editor alone): at once, with plain yields between slices.
+
+/** @returns {{ idle(fn: () => void, since?: number): void, slice?(since?: number): Promise<void>, sliceMs?: number, yielded?(): boolean } | null} */
+function draw_pen() {
+	try {
+		const pen = window.parent !== window ? /** @type {any} */ (window.parent).drawPen : null;
+		return pen && typeof pen.idle === "function" ? pen : null;
+	} catch (_error) {
+		return null;
+	}
+}
+/** ms a slice of a save may take */
+function slice_ms() {
+	return draw_pen()?.sliceMs || 4;
+}
+/**
+ * Before the next slice of a save begun at `since`; at once when `urgent` (the page is being hidden or left: the save
+ * has to start its transaction now).
+ */
+export function next_slice(urgent = false, since = Date.now()) {
+	if (urgent || document.visibilityState === "hidden") {
+		return Promise.resolve();
+	}
+	const pen = draw_pen();
+	if (pen && typeof pen.slice === "function") {
+		return Promise.resolve(pen.slice(since));
+	}
+	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+/** A slice should end early: input is waiting */
+function input_waiting() {
+	try {
+		return !!draw_pen()?.yielded?.();
+	} catch (_error) {
+		return false;
+	}
+}
+// #endregion
+
 /** A 2draw draft key (lib/drafts.ts): 12 lowercase Crockford base32 characters; anything URL-safe and short is accepted. */
 export function valid_draft_key(key) {
 	return typeof key === "string" && /^[0-9a-z_-]{4,64}$/.test(key);
@@ -438,7 +481,7 @@ function make_session_id() {
 
 /** @param {HTMLCanvasElement} canvas */
 /** Words hashed per slice (hash_image_data_sliced). */
-const HASH_SLICE_WORDS = 1 << 17;
+const HASH_SLICE_WORDS = 1 << 14;
 
 /**
  * hash_image_data in slices of HASH_SLICE_WORDS pixels with a yield between them (the same hash): a save happens
@@ -446,24 +489,28 @@ const HASH_SLICE_WORDS = 1 << 17;
  * @param {ImageData} image_data - a copy (getImageData): it doesn't change meanwhile
  * @returns {Promise<{ hash: number, longest: number }>} the hash, and the longest slice's main-thread time (ms)
  */
-export async function hash_image_data_sliced(image_data) {
+export async function hash_image_data_sliced(image_data, urgent = false, since = Date.now()) {
 	const { data, width, height } = image_data;
 	const words = new Uint32Array(data.buffer, data.byteOffset, data.byteLength >> 2);
 	let h = 0x811c9dc5;
 	h = Math.imul(h ^ width, 0x01000193);
 	h = Math.imul(h ^ height, 0x01000193);
 	let longest = 0;
+	const budget = slice_ms();
+	let t = performance.now();
 	for (let from = 0; from < words.length; from += HASH_SLICE_WORDS) {
-		const t = performance.now();
 		const to = Math.min(words.length, from + HASH_SLICE_WORDS);
 		for (let i = from; i < to; i++) {
 			h = Math.imul(h ^ words[i], 0x01000193);
 		}
-		longest = Math.max(longest, performance.now() - t);
-		if (to < words.length) {
-			await new Promise((resolve) => setTimeout(resolve, 0));
+		// (a slice ends after `budget` ms, or sooner if input is waiting)
+		if (to < words.length && !urgent && (performance.now() - t >= budget || input_waiting())) {
+			longest = Math.max(longest, performance.now() - t);
+			await next_slice(urgent, since);
+			t = performance.now();
 		}
 	}
+	longest = Math.max(longest, performance.now() - t);
 	return { hash: h >>> 0, longest };
 }
 
@@ -613,7 +660,9 @@ export class Autosaver {
 			return;
 		}
 		this.dirty = true;
-		if (this.due) {
+		if (this.due && draw_pen()) {
+			// a save is due, waiting for the pen to rest (gated_save)
+		} else if (this.due) {
 			// a save is due, waiting for the pen to lift: this change may be its lifting (checked once it is recorded)
 			if (!this.due_check) {
 				this.due_check = true;
@@ -639,6 +688,10 @@ export class Autosaver {
 			this.due = false;
 			return;
 		}
+		if (draw_pen() && !this.replaying()) {
+			this.gated_save();
+			return;
+		}
 		if (this.busy()) {
 			// mid-stroke (or replaying): saved as soon as the pen lifts (changed), or found here a moment later
 			this.due = true;
@@ -649,6 +702,39 @@ export class Autosaver {
 		// (right away, not at an idle moment: the next stroke may start any moment, and the page may be left; a save
 		// takes a few ms on the main thread)
 		this.save();
+	}
+
+	/**
+	 * On 2draw's draw page: the save once the pen rests (drawPen.idle: in a pause between strokes; after a while of
+	 * drawing without one, at the next pen-up).
+	 */
+	gated_save() {
+		if (this.due) {
+			return;
+		}
+		this.due = true;
+		draw_pen()?.idle(() => {
+			if (!this.due) {
+				return;
+			}
+			this.due = false;
+			if (!this.dirty || this.deleted || this.disabled || is_page_away()) {
+				return;
+			}
+			if (this.busy()) {
+				// (still pressed in this frame, or replaying: looked at again in a moment)
+				clearTimeout(this.timer);
+				this.timer = setTimeout(() => this.on_timer(), 250);
+				return;
+			}
+			this.save();
+		});
+	}
+
+	/** Replaying (or in a nested dispatch): no save yet */
+	replaying() {
+		const P95 = window.P95;
+		return P95.in_dispatch || P95.depth > 0 || P95.mode !== "edit";
 	}
 
 	/** Mid-stroke (or replaying): don't save now */
@@ -672,7 +758,9 @@ export class Autosaver {
 		}
 		clearTimeout(this.timer);
 		this.timer = 0;
-		return this.save();
+		this.due = false;
+		// (urgent: no slices, the transaction starts in this task)
+		return this.save(true);
 	}
 
 	/** Saves everything now and waits for it (Close: window.drawFlush). */
@@ -702,16 +790,18 @@ export class Autosaver {
 	 * Writes what changed since the last save.
 	 * @returns {Promise<void>}
 	 */
-	save() {
+	save(urgent = false) {
 		if (this.deleted || this.disabled) {
 			return Promise.resolve();
 		}
 		if (this.saving) {
 			this.again = true;
+			this.urgent ||= urgent;
 			return this.saving;
 		}
 		this.dirty = false;
 		this.due = false;
+		this.urgent = urgent;
 		this.saving = this.write().then(() => {
 			this.failed = false;
 		}, (error) => {
@@ -741,7 +831,7 @@ export class Autosaver {
 			if (this.again) {
 				this.again = false;
 				if (this.dirty && !this.failed) {
-					if (document.visibilityState === "hidden") {
+					if (document.visibilityState === "hidden" || this.urgent) {
 						// (timers may never run again in a hidden page)
 						this.save_now();
 					} else {
@@ -756,6 +846,12 @@ export class Autosaver {
 	}
 
 	async write() {
+		// (a save that waited for the pen starts in a slice of its own)
+		const since = Date.now();
+		if (!this.urgent) {
+			await next_slice(false, since);
+		}
+		const urgent = () => this.urgent || document.visibilityState === "hidden";
 		const start = performance.now();
 		const recorder = this.recorder;
 		/** @type {{ name: string, data: Uint8Array }[]} */
@@ -806,7 +902,7 @@ export class Autosaver {
 		info.duration = Math.max(recorder.last_t, Math.round(recorder.now()));
 		let sync_ms = performance.now() - start;
 		// (the picture as of now, hashed in slices with a yield between: a big canvas at once is a long task)
-		const sliced = closing.length ? null : await hash_image_data_sliced(image_data);
+		const sliced = closing.length ? null : await hash_image_data_sliced(image_data, urgent(), since);
 		const hash = sliced ? sliced.hash : null;
 		if (sliced) {
 			sync_ms = Math.max(sync_ms, sliced.longest);
